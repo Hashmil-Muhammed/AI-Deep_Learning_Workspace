@@ -1,0 +1,3 @@
+Date,Time,Shutter ID,Previous State,New State,Open Match Score,Closed Match Score
+2026-11-06,16:33:08,SHUTTER_01,UNKNOWN,OPEN,3.64,46.75
+2026-11-06,16:35:42,SHUTTER_01,OPEN,CLOSED,32.84,27.17
