@@ -14,7 +14,8 @@ import pyopencl as cl
 # Put Footage1.mp4 in the same folder as this Python file.
 # ============================================================
 
-VIDEO_PATH = "Footage1.mp4"
+VIDEO_PATH = "Footage3.mp4"
+FRAME_OUTPUT = "latest_detector_frame.jpg"
 LOG_FILE = "shutter_events_opencl.csv"
 CONFIG_DIR = Path("shutter_configuration")
 CONFIG_FILE = CONFIG_DIR / "shutters.json"
@@ -690,6 +691,38 @@ def main():
                     interpolation=cv2.INTER_AREA
                 )
 
+            success, encoded = cv2.imencode(".jpg", shown)
+
+            if success:
+                # Write to a temporary file first, then replace the dashboard frame.
+                # Windows may briefly lock FRAME_OUTPUT while the dashboard reads it.
+                temp_file = FRAME_OUTPUT + ".tmp"
+
+                try:
+                    with open(temp_file, "wb") as f:
+                        f.write(encoded.tobytes())
+
+                    try:
+                        os.replace(temp_file, FRAME_OUTPUT)
+                    except PermissionError:
+                        # The dashboard may be reading the previous JPG at this moment.
+                        # Skip this one update instead of stopping shutter detection.
+                        try:
+                            os.remove(temp_file)
+                        except OSError:
+                            pass
+
+                except OSError as exc:
+                    # Frame publishing is only for the dashboard; it must never
+                    # interrupt the AMD OpenCL detection loop.
+                    print(f"Dashboard frame update skipped: {exc}")
+                    try:
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+                    except OSError:
+                        pass
+
+            # Keep the original OpenCV video window visible as well.
             cv2.imshow("AMD OpenCL - Shutter Detection", shown)
             if cv2.waitKey(DISPLAY_WAIT_MS) & 0xFF == ord("q"):
                 break

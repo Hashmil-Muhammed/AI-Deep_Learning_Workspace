@@ -1,30 +1,30 @@
 {
-    "video_path": "Footage1.mp4",
-    "frame_width": 2560,
-    "frame_height": 1440,
+    "video_path": "Footage3.mp4",
+    "frame_width": 854,
+    "frame_height": 480,
     "shutters": [
         {
             "id": "SHUTTER_01",
             "points": [
                 [
-                    355,
-                    3
+                    414,
+                    337
                 ],
                 [
-                    484,
-                    841
+                    389,
+                    1
                 ],
                 [
-                    1205,
-                    752
+                    116,
+                    1
                 ],
                 [
-                    1163,
-                    0
+                    174,
+                    356
                 ],
                 [
-                    359,
-                    3
+                    415,
+                    337
                 ]
             ],
             "open_ref": "SHUTTER_01_open.png",
