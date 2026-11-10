@@ -10,7 +10,7 @@ from datetime import datetime
 import pyopencl as cl
 
 # AMD Radeon R5 M430 / Hainan OpenCL door detector
-DEFAULT_CCTV_SOURCE = "rtsp://admin:admin12345@192.168.100.197:554/live"
+DEFAULT_CCTV_SOURCE = "rtsp://admin:12345@192.168.100.225:554/"
 LOG_FILE = "cctv_door_events.csv"
 CONFIG_DIR = Path("cctv_door_configuration")
 CONFIG_FILE = CONFIG_DIR / "doors.json"

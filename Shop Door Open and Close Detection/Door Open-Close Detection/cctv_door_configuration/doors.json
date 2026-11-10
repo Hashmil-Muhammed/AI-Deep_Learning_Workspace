@@ -1,30 +1,29 @@
 {
-    "video_path": "Footage2.mp4",
-    "frame_width": 848,
-    "frame_height": 478,
+    "frame_width": 1920,
+    "frame_height": 1080,
     "doors": [
         {
             "id": "DOOR_01",
             "points": [
                 [
-                    268,
-                    39
+                    1088,
+                    386
                 ],
                 [
-                    602,
-                    6
+                    1328,
+                    386
                 ],
                 [
-                    492,
-                    344
+                    1334,
+                    752
                 ],
                 [
-                    341,
-                    388
+                    1088,
+                    752
                 ],
                 [
-                    269,
-                    42
+                    1084,
+                    386
                 ]
             ],
             "open_ref": "DOOR_01_open.png",
