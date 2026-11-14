@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Models & Weights (Heavy files)
+*.pt
+*.onnx
+*.pth
+*.bin
+
+# Videos & Output media
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# Temporary test crops
+crop_*.jpg
+bag_*.jpg
+f0_real_bag.jpg
+real_bag_f50.jpg
+exact_bag_sample.jpg
+crop_903.jpg
+
+# OS / Editor
+.vscode/
+.idea/
+Thumbs.db

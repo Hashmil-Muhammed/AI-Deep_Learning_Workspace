@@ -1,0 +1,13 @@
+# Core Computer Vision & Image Processing
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Deep Learning & Object/Pose Detection (YOLOv8)
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0
+
+# High-Performance ONNX Runtime Execution
+onnxruntime>=1.16.0
+# For NVIDIA GPU acceleration (optional, install if CUDA is available):
+# onnxruntime-gpu>=1.16.0
