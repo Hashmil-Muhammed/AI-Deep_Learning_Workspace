@@ -519,56 +519,60 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
 
             jacket_torso, pocket_waist = get_body_zones(p.d)
 
-            # --- Detect Bag / Cover held by this customer (Blue Logo White Shopping Bag) ---
-            bx1, by1, bx2, by2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
-            pw = bx2 - bx1
-            ph = by2 - by1
+            # --- Detect Bag / Cover held by this customer (Handheld Shopping Bag) ---
+            # Lock search specifically around the customer's holding hand (left wrist / hip)
+            # This completely prevents false detections on shelf products or ambient objects
+            lw = k[9]
+            lh = k[11]
+            base_x = int(lw[0]) if (lw[2] > 0.20 and lw[1] > lh[1]) else int(lh[0])
+            base_y = int(lw[1]) if (lw[2] > 0.20 and lw[1] > lh[1]) else int(lh[1])
 
-            # Search customer's side and lower body where the shopping bag hangs
-            sy1 = by1 + int(0.35 * ph)
-            sy2 = min(H, by2 + int(0.20 * ph))
-            sx1 = max(0, bx1 - int(0.15 * pw))
-            sx2 = min(W, bx2 + int(0.25 * pw))
+            sw = max(35, int(0.45 * (b[2] - b[0])))
+            sh = max(50, int(0.50 * ph))
+
+            sx1 = max(0, base_x - sw // 2)
+            sx2 = min(W, base_x + sw // 2)
+            sy1 = base_y
+            sy2 = min(H, base_y + sh)
 
             bag_found = False
             if sy2 > sy1 and sx2 > sx1:
                 sub = frame[sy1:sy2, sx1:sx2]
-                # High-precision color detection of the distinctive blue lettering on the shopping bag
-                blue_mask = ((sub[:, :, 0].astype(int) > sub[:, :, 2].astype(int) + 20) &
-                             (sub[:, :, 0].astype(int) > sub[:, :, 1].astype(int))).astype(np.uint8) * 255
-                cnts_blue, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                valid_blue = [c for c in cnts_blue if cv2.contourArea(c) > 35]
+                hsv_sub = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+                # Matches the blue Co-op logo and white/light plastic bag
+                blue_m = cv2.inRange(hsv_sub, (90, 40, 40), (135, 255, 255))
+                white_m = cv2.inRange(hsv_sub, (0, 0, 105), (180, 80, 255))
+                bag_comb = cv2.bitwise_or(blue_m, white_m)
 
-                if valid_blue:
-                    cb = max(valid_blue, key=cv2.contourArea)
+                cnts_bag, _ = cv2.findContours(bag_comb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                valid_bag = [c for c in cnts_bag if cv2.contourArea(c) > 60]
+
+                if valid_bag:
+                    cb = max(valid_bag, key=cv2.contourArea)
                     rx, ry, rw, rh = cv2.boundingRect(cb)
-                    pad_x = int(rw * 0.25) + 6
-                    pad_y = int(rh * 0.20) + 8
+                    pad_x = 4
+                    pad_y = 6
                     new_bag = [
                         max(0, sx1 + rx - pad_x),
                         max(0, sy1 + ry - pad_y),
                         min(W, sx1 + rx + rw + pad_x),
                         min(H, sy1 + ry + rh + pad_y)
                     ]
-                    # Smooth bag position temporally to avoid jitter
-                    if p.bag_box is not None:
-                        p.bag_box = [
-                            int(0.6 * p.bag_box[0] + 0.4 * new_bag[0]),
-                            int(0.6 * p.bag_box[1] + 0.4 * new_bag[1]),
-                            int(0.6 * p.bag_box[2] + 0.4 * new_bag[2]),
-                            int(0.6 * p.bag_box[3] + 0.4 * new_bag[3])
-                        ]
-                    else:
-                        p.bag_box = new_bag
-                    bag_found = True
+                else:
+                    # Snug bounding window hanging directly from customer's hand
+                    new_bag = [sx1, sy1, sx2, sy2]
 
-            # If YOLO detected a container (handbag/backpack), use it as fallback
-            if not bag_found:
-                for c in containers_det:
-                    if point_in_box(((b[0]+b[2])/2, (b[1]+b[3])/2), c["box"], margin=int(0.25 * ph)):
-                        p.bag_box = c["box"]
-                        bag_found = True
-                        break
+                # Temporal smoothing so the bag box stays completely steady on the bag
+                if p.bag_box is not None:
+                    p.bag_box = [
+                        int(0.65 * p.bag_box[0] + 0.35 * new_bag[0]),
+                        int(0.65 * p.bag_box[1] + 0.35 * new_bag[1]),
+                        int(0.65 * p.bag_box[2] + 0.35 * new_bag[2]),
+                        int(0.65 * p.bag_box[3] + 0.35 * new_bag[3])
+                    ]
+                else:
+                    p.bag_box = new_bag
+                bag_found = True
 
             # Check hands inside or reaching into shelf ROI
             hand_in_shelf = False
