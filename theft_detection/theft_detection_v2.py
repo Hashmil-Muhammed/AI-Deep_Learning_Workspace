@@ -520,60 +520,79 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
 
             jacket_torso, pocket_waist = get_body_zones(p.d)
 
-            # --- Detect Bag / Cover held by this customer (Handheld Shopping Bag) ---
-            # Lock search specifically around the customer's holding hand (left wrist / hip)
-            # This completely prevents false detections on shelf products or ambient objects
-            lw = k[9]
-            lh = k[11]
-            base_x = int(lw[0]) if (lw[2] > 0.20 and lw[1] > lh[1]) else int(lh[0])
-            base_y = int(lw[1]) if (lw[2] > 0.20 and lw[1] > lh[1]) else int(lh[1])
-
-            sw = max(35, int(0.45 * (b[2] - b[0])))
-            sh = max(50, int(0.50 * ph))
-
-            sx1 = max(0, base_x - sw // 2)
-            sx2 = min(W, base_x + sw // 2)
-            sy1 = base_y
-            sy2 = min(H, base_y + sh)
-
+            # --- Universal Bag / Cover Detection for Customer ---
+            # 1. Prioritize YOLO-detected Handbag / Backpack / Bag on customer
             bag_found = False
-            if sy2 > sy1 and sx2 > sx1:
-                sub = frame[sy1:sy2, sx1:sx2]
-                hsv_sub = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
-                # Matches the blue Co-op logo and white/light plastic bag
-                blue_m = cv2.inRange(hsv_sub, (90, 40, 40), (135, 255, 255))
-                white_m = cv2.inRange(hsv_sub, (0, 0, 105), (180, 80, 255))
-                bag_comb = cv2.bitwise_or(blue_m, white_m)
+            best_c_box = None
+            best_c_area = 0
 
-                cnts_bag, _ = cv2.findContours(bag_comb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                valid_bag = [c for c in cnts_bag if cv2.contourArea(c) > 60]
+            for c in containers_det:
+                cb = c["box"]
+                # Must be associated with this customer
+                if point_in_box(((cb[0] + cb[2]) / 2, (cb[1] + cb[3]) / 2), b, margin=int(0.20 * ph)):
+                    area_c = (cb[2] - cb[0]) * (cb[3] - cb[1])
+                    if area_c > best_c_area:
+                        best_c_area = area_c
+                        best_c_box = cb
 
-                if valid_bag:
-                    cb = max(valid_bag, key=cv2.contourArea)
-                    rx, ry, rw, rh = cv2.boundingRect(cb)
-                    pad_x = 4
-                    pad_y = 6
-                    new_bag = [
-                        max(0, sx1 + rx - pad_x),
-                        max(0, sy1 + ry - pad_y),
-                        min(W, sx1 + rx + rw + pad_x),
-                        min(H, sy1 + ry + rh + pad_y)
-                    ]
-                else:
-                    # Snug bounding window hanging directly from customer's hand
-                    new_bag = [sx1, sy1, sx2, sy2]
+            if best_c_box is not None:
+                new_bag = [int(best_c_box[0]), int(best_c_box[1]), int(best_c_box[2]), int(best_c_box[3])]
+                bag_found = True
+            else:
+                # 2. Handheld Bag search around holding hand (left/right wrist or hip)
+                lw = k[9]
+                rw = k[10]
+                lh = k[11]
+                rh = k[12]
 
-                # Temporal smoothing so the bag box stays completely steady on the bag
+                # Check which wrist is lower (holding bag hanging down)
+                hand_cand = lw if (lw[2] > 0.20 and lw[1] > lh[1]) else (rw if (rw[2] > 0.20 and rw[1] > rh[1]) else None)
+                base_x = int(hand_cand[0]) if hand_cand is not None else int((lh[0] + rh[0]) / 2)
+                base_y = int(hand_cand[1]) if hand_cand is not None else int((lh[1] + rh[1]) / 2)
+
+                sw = max(35, int(0.40 * (b[2] - b[0])))
+                sh = max(45, int(0.45 * ph))
+
+                sx1 = max(0, base_x - sw // 2)
+                sx2 = min(W, base_x + sw // 2)
+                sy1 = base_y
+                sy2 = min(H, base_y + sh)
+
+                if sy2 > sy1 and sx2 > sx1:
+                    sub = frame[sy1:sy2, sx1:sx2]
+                    hsv_sub = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+                    # Support white plastic, dark/black leather handbag, and branded bags
+                    blue_m = cv2.inRange(hsv_sub, (90, 40, 40), (135, 255, 255))
+                    white_m = cv2.inRange(hsv_sub, (0, 0, 105), (180, 80, 255))
+                    dark_m = cv2.inRange(hsv_sub, (0, 0, 15), (180, 255, 75))
+                    bag_comb = cv2.bitwise_or(blue_m, cv2.bitwise_or(white_m, dark_m))
+
+                    cnts_bag, _ = cv2.findContours(bag_comb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    valid_bag = [c for c in cnts_bag if cv2.contourArea(c) > 60]
+
+                    if valid_bag:
+                        cb = max(valid_bag, key=cv2.contourArea)
+                        rx, ry, rw_b, rh_b = cv2.boundingRect(cb)
+                        new_bag = [
+                            max(0, sx1 + rx - 4),
+                            max(0, sy1 + ry - 6),
+                            min(W, sx1 + rx + rw_b + 4),
+                            min(H, sy1 + ry + rh_b + 6)
+                        ]
+                    else:
+                        new_bag = [sx1, sy1, sx2, sy2]
+                    bag_found = True
+
+            if bag_found:
                 if p.bag_box is not None:
                     p.bag_box = [
-                        int(0.65 * p.bag_box[0] + 0.35 * new_bag[0]),
-                        int(0.65 * p.bag_box[1] + 0.35 * new_bag[1]),
-                        int(0.65 * p.bag_box[2] + 0.35 * new_bag[2]),
-                        int(0.65 * p.bag_box[3] + 0.35 * new_bag[3])
+                        int(0.60 * p.bag_box[0] + 0.40 * new_bag[0]),
+                        int(0.60 * p.bag_box[1] + 0.40 * new_bag[1]),
+                        int(0.60 * p.bag_box[2] + 0.40 * new_bag[2]),
+                        int(0.60 * p.bag_box[3] + 0.40 * new_bag[3])
                     ]
                 else:
                     p.bag_box = new_bag
-                bag_found = True
 
             # Check hands inside or reaching into shelf ROI
             hand_in_shelf = False
@@ -855,8 +874,8 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
 
 # ─────────────────────────── CLI ENTRYPOINT ─────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="AI Retail Theft Detection v2")
-    parser.add_argument("video", nargs="?", default="Video Project 1.mp4", help="Video path")
+    parser = argparse.ArgumentParser(description="AI Retail Theft Detection v2 (vid2.mp4)")
+    parser.add_argument("video", nargs="?", default="vid2.mp4", help="Video path")
     parser.add_argument("--model-size", default="n", choices=["n", "s", "m", "l", "x"], help="YOLO model size (n=nano is fastest, m=medium)")
     parser.add_argument("--skip-frames", type=int, default=2, help="Number of frames to skip detection (tracks & caches in-between for smoothness)")
     parser.add_argument("--no-save", action="store_true", help="Do not write output video file")
