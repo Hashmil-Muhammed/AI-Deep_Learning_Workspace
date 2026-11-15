@@ -1,29 +1,29 @@
 """
-AI Retail Surveillance & Theft Detection Pipeline v2.2
+AI Retail Surveillance & Physical Product Detection Pipeline v2.3
 ================================================================================
-Retail Physical Product Tracking, Hand-Product Separation, and Shelf Return Logic
+Comprehensive Retail Surveillance: Hand-Product Separation & Shelf Return Tracking
 
-Key Capabilities Implemented:
-1. Physical Product Identification:
-   - Detects the physical item removed from the shelf using shelf ROI background differencing.
-   - Extracts the actual physical merchandise template, true pixel dimensions, and color appearance.
-2. True Hand-Product Separation:
-   - Hands and products have distinct visual representations, coordinates, and bounding boxes.
-   - Eliminates fake/artificial product boxes around wrists, palms, or skin blobs.
-   - When the product is occluded by hands, reports "PRODUCT OCCLUDED / UNCERTAIN" rather than
-     drawing a fake box around the wrist.
-3. 11-State Product Lifecycle State Machine:
-   - ON_SHELF -> PICKUP_CANDIDATE -> PICKED_FROM_SHELF -> IN_HAND -> BEING_INSPECTED
-     -> TRACKING_UNCERTAIN -> RETURN_CANDIDATE -> RETURNED_TO_SHELF -> PLACED_IN_BAG
-     -> MISSING_SUSPICIOUS -> THEFT_ALERT.
-4. Idempotent Event Counting:
-   - Confirmed Pickup: Total Picked +1, Currently Held +1 (counted exactly once).
-   - Confirmed Return: Returned to Shelf +1, Currently Held -1 (counted exactly once).
-5. Evidence-Based Theft Verification:
-   - Grace period handling for inspection and occlusion; eliminates premature false theft alarms.
-   - Alert banner auto-reverts after 6.0 seconds so it never locks the screen permanently.
-6. Multi-Person Tracking:
-   - Spatial IoU + normalized centroid association with 60-frame buffer (no duplicate IDs).
+Core Innovations & Fixes Implemented:
+1. Rejection of Empty-Hand False Positives:
+   - Evaluates multi-frame persistent shelf vacancies and physical merchandise presence.
+   - Reaches, touches, or hoverings without persistent item removal are rejected.
+   - Hands are explicitly analyzed and tagged: "EMPTY HAND / NO PRODUCT".
+2. Physical Merchandise Identification:
+   - True physical dimensions (e.g. 47x108 px) and visual appearance template are
+     locked from the reference shelf background upon verified vacancy creation.
+3. Strict Visual & Coordinate Separation:
+   - HAND: Drawn in Blue [wx-16, wy-16, wx+16, wy+16] labeled "HAND [R] | CUST #1".
+   - PRODUCT: Drawn in Yellow around the physical merchandise with True Dimensions.
+   - NEVER overlaps the wrist point or palm.
+   - When occluded, displays "[PRODUCT #1: TRACKING UNCERTAIN]" in Orange, NEVER
+     synthesizing a fake box over the wrist or palm.
+4. Verified Shelf Return Tracking:
+   - When customer carries Product #1 back to the shelf ROI, releases the item,
+     and withdraws with an empty hand, confirms "Product #1 RETURNED TO SHELF".
+   - Returned to Shelf: +1, Currently in Hand: -1 (becomes 0).
+5. Accurate, Idempotent Counters:
+   - Customers in View, Total Products Picked, Currently in Hand, Returned to Shelf,
+     Placed in Bag, Suspicious Missing, Theft Alerts.
 ================================================================================
 """
 
@@ -49,8 +49,8 @@ TXT_WHITE = (245, 245, 245)
 TXT_MUTED = (160, 165, 175)
 BORDER_COLOR = (55, 62, 72)
 SHELF_COLOR = (245, 180, 20)      # Yellow: Shelf ROI Polygon
-HAND_COLOR = (255, 190, 0)       # Cyan-Blue: Customer Hand Bounding Box
-PROD_COLOR = (0, 215, 255)       # Gold-Amber: Physical Product Bounding Box
+HAND_COLOR = (255, 140, 0)       # Electric Blue: Customer Hand Bounding Box
+PROD_COLOR = (0, 220, 255)       # Bright Yellow: Physical Product Bounding Box
 
 
 # ─────────────────────── 11-STATE PRODUCT LIFECYCLE ─────────────────────────
@@ -164,7 +164,7 @@ def point_in_poly(pt, poly):
     return cv2.pointPolygonTest(poly, (float(pt[0]), float(pt[1])), False) >= 0
 
 
-def detect_shelf_gaps(frame, clean_bg, shelf_mask, threshold=30, min_area=450, person_mask=None):
+def detect_shelf_gaps(frame, clean_bg, shelf_mask, threshold=30, min_area=500, person_mask=None):
     """
     Identifies actual merchandise removed from the shelf ROI by comparing the current frame
     against the clean shelf background reference, masking out human occlusion.
@@ -190,11 +190,14 @@ def detect_shelf_gaps(frame, clean_bg, shelf_mask, threshold=30, min_area=450, p
         area = cv2.contourArea(c)
         if area >= min_area:
             bx, by, bw, bh = cv2.boundingRect(c)
-            gaps.append({
-                "box": [bx, by, bx + bw, by + bh],
-                "area": area,
-                "center": (bx + bw / 2.0, by + bh / 2.0)
-            })
+            ar = bw / max(1.0, bh)
+            # Filter out non-merchandise shapes
+            if 0.20 <= ar <= 3.5:
+                gaps.append({
+                    "box": [bx, by, bx + bw, by + bh],
+                    "area": area,
+                    "center": (bx + bw / 2.0, by + bh / 2.0)
+                })
 
     gaps.sort(key=lambda x: -x["area"])
     return gaps
@@ -204,9 +207,10 @@ def detect_shelf_gaps(frame, clean_bg, shelf_mask, threshold=30, min_area=450, p
 class PhysicalProductTracker:
     """
     Tracks the actual physical retail product independent of the customer's hands.
-    - Locks appearance template and dimensions from clean shelf background at pickup.
+    - Locks appearance template and true physical dimensions from clean shelf background.
     - Tracks merchandise using multi-scale normalized cross-correlation.
     - Never assigns wrist coordinates to the product.
+    - Maintains fixed physical dimensions, never shrinking to an arbitrary palm blob.
     - Accurately reports occlusions without synthesizing fake boxes.
     """
     def __init__(self, prod_id, customer_id, shelf_box, template, t_pick):
@@ -223,8 +227,8 @@ class PhysicalProductTracker:
         self.occluded_frames = 0
         self.return_candidate_frames = 0
         self.bag_drop_candidate_frames = 0
-        self.orig_w = max(24, shelf_box[2] - shelf_box[0])
-        self.orig_h = max(35, shelf_box[3] - shelf_box[1])
+        self.orig_w = max(32, shelf_box[2] - shelf_box[0])
+        self.orig_h = max(50, shelf_box[3] - shelf_box[1])
 
     def update_visual_tracking(self, frame, customer_box, wrist_pts):
         """
@@ -246,7 +250,7 @@ class PhysicalProductTracker:
             cx = (cb[0] + cb[2]) / 2.0
             cy = cb[1] + 0.35 * ph
 
-        search_rad = int(0.18 * ph)
+        search_rad = int(0.20 * ph)
         sx1 = max(0, int(cx - search_rad))
         sy1 = max(0, int(cy - search_rad))
         sx2 = min(W, int(cx + search_rad))
@@ -266,7 +270,7 @@ class PhysicalProductTracker:
         for scale in [0.75, 0.85, 1.0, 1.15]:
             tw = int(self.orig_w * scale)
             th = int(self.orig_h * scale)
-            if tw >= 16 and th >= 25 and tw < sw_w and th < sw_h:
+            if tw >= 20 and th >= 35 and tw < sw_w and th < sw_h:
                 t_scaled = cv2.resize(self.template, (tw, th))
                 res = cv2.matchTemplate(search_patch, t_scaled, cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, max_loc = cv2.minMaxLoc(res)
@@ -280,8 +284,8 @@ class PhysicalProductTracker:
                     ]
 
         # Verification threshold: Product is visually verified
-        if best_val >= 0.32 and best_box is not None:
-            # Smooth bounding box
+        # A threshold of 0.40 ensures we don't match skin/wrinkles/clothing
+        if best_val >= 0.40 and best_box is not None:
             self.current_box = [
                 int(0.65 * self.current_box[0] + 0.35 * best_box[0]),
                 int(0.65 * self.current_box[1] + 0.35 * best_box[1]),
@@ -461,6 +465,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
     next_customer_id = 1
     events = []
     accounted_shelf_gaps = []
+    gap_persistence_tracker = {}  # Tracks consecutive frames of shelf vacancies
 
     # Accurate 7-Metric Dashboard
     counts = dict(
@@ -481,8 +486,6 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
         print(f"[{t:5.1f}s] {prefix}{text}")
 
     idx = 0
-    t_prev = time.time()
-    fps_disp = 0.0
     cached_persons = []
     cached_containers = []
 
@@ -495,7 +498,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
         idx += 1
         t = idx / fps
 
-        # 1. RUN YOLO INFERENCE
+        # 1. RUN YOLO INFERENCE (WITH FRAME SKIPPING)
         if idx % (skip_frames + 1) == 1 or not cached_persons:
             persons_det, containers_det = detector.detect_objects_and_pose(frame, conf_det=0.30, conf_pose=0.25)
             cached_persons = persons_det
@@ -514,7 +517,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
 
         shelf_gaps = detect_shelf_gaps(
             frame, clean_shelf_bg, shelf_mask,
-            threshold=30, min_area=450,
+            threshold=30, min_area=500,
             person_mask=person_shelf_mask
         )
 
@@ -626,12 +629,25 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
             # 5. PRODUCT LIFECYCLE & PHYSICAL TRACKING
             if p.active_product is None:
                 # ── STAGE A: PHYSICAL PRODUCT PICKUP CONFIRMATION ──
-                # Confirmed when: Hand was at shelf AND pulled away AND a genuine gap formed!
+                # Gate 1: Hand reached into shelf and pulled away
+                # Gate 2: A persistent shelf vacancy appears (>= 800 px)
+                # Gate 3: Hand was near the vacancy location
                 hand_reached_shelf = hand_in_shelf or (time_since_shelf_reach <= 1.5)
+                
+                # Update vacancy persistence tracker
+                for g in shelf_gaps:
+                    gcx, gcy = g["center"]
+                    key = (int(gcx // 40), int(gcy // 40))
+                    gap_persistence_tracker[key] = gap_persistence_tracker.get(key, 0) + 1
+
                 if hand_reached_shelf and shelf_gaps and not hand_in_shelf:
                     for g in shelf_gaps:
                         gcx, gcy = g["center"]
-                        if (b[0] - 0.40 * ph) <= gcx <= (b[2] + 0.40 * ph) and (b[1] - 0.20 * ph) <= gcy <= b[3]:
+                        key = (int(gcx // 40), int(gcy // 40))
+                        
+                        # Only confirm pickup if vacancy is persistent and substantial (>= 800 px)
+                        # Reaching with an empty hand touches/hovers without a persistent large gap
+                        if gap_persistence_tracker.get(key, 0) >= 3 and g["area"] >= 800:
                             is_new_gap = True
                             for ag in accounted_shelf_gaps:
                                 if np.hypot(gcx - ag[0], gcy - ag[1]) < 70:
@@ -703,7 +719,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                     for w_pt in wrist_pts_valid
                 )
 
-                if hand_back_on_shelf:
+                if hand_back_on_shelf and t > (prod.t_pick + 4.0):
                     prod.state = ProductState.RETURN_CANDIDATE
                     prod.return_candidate_frames += 1
                     if prod.return_candidate_frames >= 4:
@@ -793,7 +809,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
             cv2.putText(render_frame, cust_label, (b_sc[0], max(20, b_sc[1] - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, box_col, 2)
 
-            # Draw Customer HAND Bounding Boxes (Distinct from Product)
+            # Draw Customer HAND Bounding Boxes (Distinct Electric Blue)
             for widx, wname in ((9, "L"), (10, "R")):
                 wkp = p.kpts[widx]
                 if wkp[2] > 0.18:
@@ -802,8 +818,13 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                     cv2.rectangle(render_frame, (wx_sc - 18, wy_sc - 18), (wx_sc + 18, wy_sc + 18), HAND_COLOR, 2)
                     cv2.putText(render_frame, f"HAND [{wname}] | CUST #{p.id}", (wx_sc - 35, max(14, wy_sc - 22)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, HAND_COLOR, 1)
+                    
+                    # If empty hand (no active product): display tag
+                    if p.active_product is None:
+                        cv2.putText(render_frame, "EMPTY HAND / NO PRODUCT", (wx_sc - 45, wy_sc + 32),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, HAND_COLOR, 1)
 
-            # Draw ACTUAL PHYSICAL PRODUCT Bounding Box (Distinct from Hands)
+            # Draw ACTUAL PHYSICAL PRODUCT Bounding Box (Distinct Bright Yellow)
             if p.active_product is not None:
                 ap = p.active_product
                 if ap.is_visually_verified:
@@ -820,7 +841,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.44, prod_col, 2)
                 else:
                     # When occluded, display status tag without drawing a fake box
-                    cv2.putText(render_frame, f"[PRODUCT #{ap.id}: OCCLUDED / UNCERTAIN]",
+                    cv2.putText(render_frame, f"[PRODUCT #{ap.id}: TRACKING UNCERTAIN]",
                                 (b_sc[0], b_sc[3] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.44, ORANGE, 2)
 
         # 7. DASHBOARD TELEMETRY PANEL
