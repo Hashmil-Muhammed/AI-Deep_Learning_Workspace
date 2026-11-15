@@ -4,30 +4,32 @@ theft_detection_vid2.py
 Advanced Retail Theft Detection Pipeline (Optimized for vid2.mp4 & Retail CCTVs):
 
 Key Capabilities:
-1. Accurate Shelf ROI Product Pick Detection:
-   - When customer reaches into the marked shelf ROI and takes a product:
-     -> State: 'HOLDING PRODUCT'
-     -> Took Product count (+1)
-     -> Currently in Hand count (+1)
-     -> Visual highlight around the held product: [PRODUCT IN HAND].
+1. True Product Detection & Tracking (NOT the hand):
+   - Accurately detects and segments the actual PRODUCT taken from the shelf.
+   - Does NOT label the customer's hand as a product.
+   - Puts a dedicated bounding box around the actual product: [PRODUCT: #1].
+   - Tracks the product while held in hand -> Live count: 'Currently in Hand'.
 
-2. Product Return Detection (Put Back on Shelf):
-   - When product is returned back to the masked shelf:
+2. Shelf Return Detection (Put Back on Shelf):
+   - Focused tracking checks if the product is returned back to the masked shelf:
      -> State: 'PUT BACK ON SHELF'
      -> Put Back on Shelf count (+1)
      -> Currently in Hand count (-1).
 
-3. Accurate Shoulder Bag & Cover Detection:
-   - Tracks shoulder bags ("thollil ulla bag") and bags across frames smoothly.
-   - If product placed into bag -> State: 'PLACED IN COVER (SAFE)'.
+3. Shoulder Bag / Cover Placement (Safe):
+   - Accurately detects and tracks customer's shoulder bag or bag.
+   - If product is placed into bag:
+     -> State: 'PLACED IN COVER (SAFE)'
+     -> Placed in Cover/Bag count (+1)
+     -> Currently in Hand count (-1).
 
-4. Theft Alert (Item Missing / Concealed):
-   - If a product is taken from the shelf and in hand, and WITHOUT putting it back
-     on the shelf it is no longer seen in hand (concealed into coat, pocket, or missing)
+4. Theft Alert (Product Missing / Concealed):
+   - If product was taken from shelf, and is NOT returned to the shelf,
+     and is no longer seen in hand (concealed into coat, pocket, or missing):
      -> State: 'THEFT ALERT (ITEM MISSING)'
      -> THEFT ALERTS count (+1)
      -> Currently in Hand count (-1)
-     -> Flashing RED alert banner and sound/log trigger.
+     -> Flashing RED alert banner and activity log.
 """
 
 import cv2
@@ -194,11 +196,14 @@ def point_in_poly(pt, poly):
     return cv2.pointPolygonTest(poly, (float(pt[0]), float(pt[1])), False) >= 0
 
 
-# ──────────────────────── HAND & PRODUCT ANALYSIS ───────────────────────────
-def analyze_hand_patch(img, palm_pt, padding_size=28, bg_patch=None):
+# ──────────────────────── PRODUCT ISOLATION & ANALYSIS ──────────────────────
+def analyze_hand_patch(img, wrist_pt, palm_pt, padding_size=28, bg_patch=None):
     """
-    Carefully inspects the palm/wrist region for genuine foreign products.
-    Differentiates bare skin from products (cans, bottles, boxes, packaging).
+    Carefully isolates the ACTUAL PRODUCT from the hand.
+    Returns:
+        has_product (bool)
+        product_box [x1, y1, x2, y2] - tight bounding box of the product itself (NOT the hand)
+        confidence (float)
     """
     H, W = img.shape[:2]
     x, y = int(palm_pt[0]), int(palm_pt[1])
@@ -208,13 +213,13 @@ def analyze_hand_patch(img, palm_pt, padding_size=28, bg_patch=None):
     y2 = min(H, y + padding_size)
 
     if (x2 - x1) < 12 or (y2 - y1) < 12:
-        return False, None, None, 0.0, None, 0.0
+        return False, None, 0.0
 
     patch = img[y1:y2, x1:x2]
     hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
     ycrcb = cv2.cvtColor(patch, cv2.COLOR_BGR2YCrCb)
 
-    # 1. Skin tone detector (HSV + YCrCb intersection)
+    # 1. Skin tone detector (HSV + YCrCb)
     hsv_skin = cv2.inRange(hsv, (0, 20, 40), (25, 200, 255)) | cv2.inRange(hsv, (170, 20, 40), (180, 200, 255))
     ycrcb_skin = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
     skin_mask = cv2.bitwise_and(hsv_skin, ycrcb_skin)
@@ -233,7 +238,7 @@ def analyze_hand_patch(img, palm_pt, padding_size=28, bg_patch=None):
     # 3. Vivid / packaging colors
     vivid_mask = cv2.inRange(hsv, (0, 40, 35), (180, 255, 255))
 
-    # Candidate object pixels
+    # Candidate object pixels (non-skin product features)
     candidate = cv2.bitwise_or(vivid_mask, diff_mask) if bg_patch is not None else vivid_mask
     object_mask = cv2.bitwise_and(candidate, cv2.bitwise_not(skin_mask))
     object_mask = cv2.morphologyEx(object_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
@@ -248,22 +253,24 @@ def analyze_hand_patch(img, palm_pt, padding_size=28, bg_patch=None):
     edges = cv2.Canny(gray, 30, 100)
     edge_density = np.mean(edges > 0)
 
-    # Product is verified if:
+    # Condition for genuine product in hand:
     # A) Significant non-skin packaging blob, OR
     # B) High edge density/texture from product packaging while not dominated by skin
     is_product = (area >= 18 and ratio >= 0.04 and skin_ratio < 0.85) or (edge_density >= 0.075 and skin_ratio < 0.82)
 
     if is_product:
+        # Compute tight product box centered on the grasp
         if max_c is not None and area >= 12:
             bx, by, bw, bh = cv2.boundingRect(max_c)
-            global_box = [x1 + bx, y1 + by, x1 + bx + bw, y1 + by + bh]
-            mean_bgr = cv2.mean(patch, mask=object_mask)[:3]
+            # Ensure it fits the item
+            product_box = [x1 + bx, y1 + by, x1 + bx + bw, y1 + by + bh]
         else:
-            global_box = [x1 + 4, y1 + 4, x2 - 4, y2 - 4]
-            mean_bgr = (0, 215, 255)
-        return True, object_mask, global_box, ratio, mean_bgr, skin_ratio
+            # Default tight product dimensions extending from grip
+            hw, hh = 12, 22
+            product_box = [int(palm_pt[0]) - hw, int(palm_pt[1]) - hh, int(palm_pt[0]) + hw, int(palm_pt[1]) + hh]
+        return True, product_box, edge_density
 
-    return False, None, None, ratio, None, skin_ratio
+    return False, None, edge_density
 
 
 # ────────────────────────── INTERACTIVE SHELF DRAWER ────────────────────────
@@ -379,6 +386,17 @@ def draw_shelf_roi(video_path: str):
     return [[(int(p[0] / sx), int(p[1] / sy)) for p in poly] for poly in polys]
 
 
+# ─────────────────────────── TRACKED PRODUCT CLASS ──────────────────────────
+class TrackedProduct:
+    def __init__(self, prod_id, box, customer_id, t_pick):
+        self.id = prod_id
+        self.box = box                   # tight product bbox [x1, y1, x2, y2]
+        self.customer_id = customer_id
+        self.t_pick = t_pick
+        self.t_last_seen = t_pick
+        self.status = "IN_HAND"          # "IN_HAND", "RETURNED", "PLACED_IN_BAG", "THEFT"
+
+
 # ─────────────────────────── TRACKED PERSON CLASS ───────────────────────────
 class CustomerTrack:
     def __init__(self, pid, d, t):
@@ -388,14 +406,11 @@ class CustomerTrack:
         self.t = t
         self.state = "BROWSING"   # BROWSING, REACHING SHELF, HOLDING PRODUCT, PLACED IN COVER (SAFE), PUT BACK ON SHELF, THEFT ALERT
         self.hands_in_shelf = False
-        self.holding_item = False
-        self.held_items_count = 0
-        self.item_color_bgr = None
-        self.item_box = None
-        self.item_took_time = None
-        self.last_item_seen_time = -99.0
         self.last_shelf_time = -99.0
         self.theft_flagged = False
+
+        # Dedicated product tracking (Focus on actual product, not hand)
+        self.active_product = None
 
         # Bag / Cover Tracking
         self.bag_box = None              # Smooth bounding box [x1, y1, x2, y2]
@@ -598,8 +613,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
             # ──────────────── HAND & SHELF INTERACTION ANALYSIS ────────────────
             hand_in_shelf = False
             object_in_hand = False
-            detected_obj_box = None
-            obj_color = None
+            detected_prod_box = None
             reach_margin = int(0.06 * ph)
 
             for w_idx, e_idx in ((9, 7), (10, 8)):
@@ -618,7 +632,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                     palm_center = w[:2]
                 palm_pt = (int(palm_center[0]), int(palm_center[1]))
 
-                # Check if wrist or palm is in shelf ROI
+                # Check if wrist or palm is inside shelf ROI
                 in_shelf = (
                     any(cv2.pointPolygonTest(s, (float(palm_pt[0]), float(palm_pt[1])), True) >= -reach_margin for s in shelf_np) or
                     any(cv2.pointPolygonTest(s, (float(w_pt[0]), float(w_pt[1])), True) >= -reach_margin for s in shelf_np)
@@ -633,49 +647,51 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                 y2_bg = min(H, palm_pt[1] + pad_size)
                 bg_crop = clean_shelf_bg[y1_bg:y2_bg, x1_bg:x2_bg] if (x2_bg > x1_bg and y2_bg > y1_bg) else None
 
-                # Analyze palm patch: verify if non-skin foreign object exists
-                has_obj, o_mask, o_box, o_ratio, o_col, s_ratio = analyze_hand_patch(
-                    frame, palm_pt, padding_size=pad_size, bg_patch=bg_crop
+                # Isolate the actual product from hand
+                has_obj, p_box, conf = analyze_hand_patch(
+                    frame, w_pt, palm_pt, padding_size=pad_size, bg_patch=bg_crop
                 )
 
                 if has_obj:
                     object_in_hand = True
-                    detected_obj_box = o_box
-                    obj_color = o_col
+                    detected_prod_box = p_box
 
             p.hands_in_shelf = hand_in_shelf
             if hand_in_shelf:
                 p.last_shelf_time = t
 
-            # ──────────────────── STATE MACHINE & DESTINATION LOGIC ────────────────────
+            # ──────────────────── PRODUCT FOCUS & STATE MACHINE ────────────────────
             time_since_shelf = t - p.last_shelf_time
 
-            # 1. Product Pick Detection: Hand touched shelf and now holds a verified product
-            if (hand_in_shelf or time_since_shelf <= 1.6) and object_in_hand and not p.holding_item:
-                p.holding_item = True
-                p.item_took_time = t
-                p.item_color_bgr = obj_color or (0, 200, 255)
-                p.item_box = detected_obj_box
-                p.last_item_seen_time = t
+            # 1. Product Pick Detection: Hand touched shelf and now holds a verified product (NOT hand)
+            if (hand_in_shelf or time_since_shelf <= 1.6) and object_in_hand and (p.active_product is None):
+                prod_id = counts["took_product"] + 1
+                p.active_product = TrackedProduct(
+                    prod_id=prod_id,
+                    box=detected_prod_box,
+                    customer_id=p.id,
+                    t_pick=t
+                )
                 p.state = "HOLDING PRODUCT"
-                p.held_items_count += 1
                 counts["took_product"] += 1
                 counts["currently_held"] += 1
-                log_event(t, f"Customer #{p.id}: TOOK PRODUCT from shelf (Currently in Hand: {counts['currently_held']})", AMB)
+                log_event(t, f"Customer #{p.id}: TOOK PRODUCT #{prod_id} from shelf (Currently in Hand: {counts['currently_held']})", AMB)
 
-            # 2. While holding item: check whether kept in hand, returned, placed in bag, or missing/theft
-            elif p.holding_item:
+            # 2. While holding item: continuously track the product, check for return, bag, or theft
+            elif p.active_product is not None:
                 if object_in_hand:
-                    p.last_item_seen_time = t
-                    p.item_box = detected_obj_box
+                    # Product is directly observed in hand
+                    if detected_prod_box is not None:
+                        p.active_product.box = detected_prod_box
+                    p.active_product.t_last_seen = t
                     p.state = "HOLDING PRODUCT"
                     p.return_candidate_frames = 0
                     p.bag_drop_candidate_frames = 0
                     p.disappear_candidate_frames = 0
                 else:
-                    # Item no longer detected in hand: resolve destination
+                    # Product no longer in hand! Evaluate where it went
 
-                    # Check A: Returned to Shelf
+                    # Condition A: Returned to Shelf
                     hand_back_on_shelf = hand_in_shelf or any(
                         cv2.pointPolygonTest(s, (float(k[h_idx][0]), float(k[h_idx][1])), True) >= -reach_margin
                         for s in shelf_np
@@ -683,7 +699,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                         if k[h_idx][2] > 0.15
                     )
 
-                    # Check B: Placed into Shoulder Bag or Cover
+                    # Condition B: Placed into Shoulder Bag or Cover
                     hand_at_bag = False
                     matched_bag_label = p.bag_type
                     if p.bag_box is not None:
@@ -711,12 +727,11 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                     if hand_back_on_shelf:
                         p.return_candidate_frames += 1
                         if p.return_candidate_frames >= 2:
-                            p.holding_item = False
-                            p.held_items_count = max(0, p.held_items_count - 1)
                             p.state = "PUT BACK ON SHELF"
                             counts["put_back"] += 1
                             counts["currently_held"] = max(0, counts["currently_held"] - 1)
-                            log_event(t, f"Customer #{p.id}: Product returned to shelf (Total Returned: {counts['put_back']})", CYN)
+                            log_event(t, f"Customer #{p.id}: Product #{p.active_product.id} returned to shelf (Total Returned: {counts['put_back']})", CYN)
+                            p.active_product = None
                             p.bag_drop_candidate_frames = 0
                             p.return_candidate_frames = 0
                             p.disappear_candidate_frames = 0
@@ -724,28 +739,26 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                     elif hand_at_bag:
                         p.bag_drop_candidate_frames += 1
                         if p.bag_drop_candidate_frames >= 2:
-                            p.holding_item = False
-                            p.held_items_count = max(0, p.held_items_count - 1)
                             p.state = "PLACED IN COVER (SAFE)"
                             counts["placed_cart"] += 1
                             counts["currently_held"] = max(0, counts["currently_held"] - 1)
-                            log_event(t, f"Customer #{p.id}: Product placed into {matched_bag_label} (Total in Bag: {counts['placed_cart']})", GRN)
+                            log_event(t, f"Customer #{p.id}: Product #{p.active_product.id} placed into {matched_bag_label} (Total in Bag: {counts['placed_cart']})", GRN)
+                            p.active_product = None
                             p.bag_drop_candidate_frames = 0
                             p.return_candidate_frames = 0
                             p.disappear_candidate_frames = 0
 
                     else:
-                        # Product missing / not returned to shelf -> THEFT ALERT!
-                        time_since_disappear = t - p.last_item_seen_time
+                        # Product missing / NOT returned to shelf -> THEFT ALERT!
+                        time_since_disappear = t - p.active_product.t_last_seen
                         p.disappear_candidate_frames += 1
                         if time_since_disappear >= 0.35 and p.disappear_candidate_frames >= 3:
-                            p.holding_item = False
-                            p.held_items_count = max(0, p.held_items_count - 1)
                             p.theft_flagged = True
                             p.state = "THEFT ALERT (ITEM MISSING)"
                             counts["theft_suspicion"] += 1
                             counts["currently_held"] = max(0, counts["currently_held"] - 1)
-                            log_event(t, f"Customer #{p.id}: 🚨 THEFT ALERT! Product missing (Not in hand, Not returned to shelf)", RED)
+                            log_event(t, f"Customer #{p.id}: 🚨 THEFT ALERT! Product #{p.active_product.id} missing (Not returned to shelf)", RED)
+                            p.active_product = None
                             p.bag_drop_candidate_frames = 0
                             p.return_candidate_frames = 0
                             p.disappear_candidate_frames = 0
@@ -797,23 +810,34 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                 cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (50, 220, 120), 2)
                 cv2.putText(canvas, f"[{p.bag_type}]", (bx1, max(14, by1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (50, 220, 120), 1, cv2.LINE_AA)
 
-            # Draw Hands & Held Product
+            # Draw Hands as small clean keypoint dots (NOT products)
             for w_idx in (9, 10):
                 w = k[w_idx]
                 if w[2] > 0.15:
                     wx = int(w[0] * sx_render)
                     wy = int(w[1] * sy_render)
-                    hand_col = AMB if p.holding_item else (CYN if p.hands_in_shelf else GRN)
-                    cv2.circle(canvas, (wx, wy), 6, hand_col, -1)
-                    cv2.circle(canvas, (wx, wy), 9, (255, 255, 255), 1)
+                    cv2.circle(canvas, (wx, wy), 4, (200, 240, 255), -1)
+                    cv2.circle(canvas, (wx, wy), 6, (120, 120, 120), 1)
 
-            if p.holding_item and p.item_box is not None:
-                ix1 = int(p.item_box[0] * sx_render)
-                iy1 = int(p.item_box[1] * sy_render)
-                ix2 = int(p.item_box[2] * sx_render)
-                iy2 = int(p.item_box[3] * sy_render)
-                cv2.rectangle(canvas, (ix1, iy1), (ix2, iy2), (0, 215, 255), 2)
-                cv2.putText(canvas, "PRODUCT IN HAND", (ix1, max(14, iy1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 215, 255), 1)
+            # Draw the ACTUAL PRODUCT BOX (Tight bounding box around the product itself)
+            if p.active_product is not None and p.active_product.box is not None:
+                px1 = int(p.active_product.box[0] * sx_render)
+                py1 = int(p.active_product.box[1] * sy_render)
+                px2 = int(p.active_product.box[2] * sx_render)
+                py2 = int(p.active_product.box[3] * sy_render)
+
+                # Ensure valid dimensions
+                if (px2 - px1) < 14:
+                    px2 = px1 + 14
+                if (py2 - py1) < 20:
+                    py2 = py1 + 20
+
+                # Highlight the actual product
+                prod_ov = canvas.copy()
+                cv2.rectangle(prod_ov, (px1, py1), (px2, py2), (0, 215, 255), -1)
+                cv2.addWeighted(prod_ov, 0.25, canvas, 0.75, 0, canvas)
+                cv2.rectangle(canvas, (px1, py1), (px2, py2), (0, 230, 255), 2)
+                cv2.putText(canvas, f"PRODUCT #{p.active_product.id}", (px1 - 10, max(16, py1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 230, 255), 2)
 
         # ────────────────────────── TELEMETRY PANEL ──────────────────────────
         px0 = vw
@@ -828,7 +852,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
 
         # Dynamic Status Banner
         any_theft = any(p.theft_flagged for p in people.values())
-        any_holding = any(p.holding_item for p in people.values())
+        any_holding = any(p.active_product is not None for p in people.values())
         any_reaching = any(p.hands_in_shelf for p in people.values())
         any_safe = any("SAFE" in p.state for p in people.values())
 
@@ -875,7 +899,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
             y_c += 20
 
         # Footer
-        cv2.putText(panel, "Shelf Tracking • Shoulder Bag • Anti-Theft Guard", (18, 705), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (90, 90, 100), 1)
+        cv2.putText(panel, "Product Tracking • Shoulder Bag • Anti-Theft Guard", (18, 705), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (90, 90, 100), 1)
 
         # Save and display
         if wr:
