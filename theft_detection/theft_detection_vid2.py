@@ -1,90 +1,82 @@
 """
-theft_detection_vid2.py
-=======================
-Advanced Real-Time AI Retail Product Tracking & Theft Detection Pipeline
-Engineered for CCTV Retail Surveillance (vid2.mp4, Video Project 1.mp4, and Live Feeds).
+AI Retail Surveillance & Theft Detection Pipeline v2.2
+================================================================================
+Retail Physical Product Tracking, Hand-Product Separation, and Shelf Return Logic
 
-Comprehensive Fixes & Capabilities Implemented:
-1. Robust Multi-Person Tracking (ByteTrack / Centroid + Motion Predictor):
-   - Persistent customer IDs across motion, turning, and occlusion (60-frame buffer).
-   - Eliminates duplicate customer IDs and repeated entry events.
-   - Accurately associates pose keypoints (wrists, elbows) with the correct customer.
-
-2. Precise Physical Product Isolation (NOT the Hand, NOT the Head):
-   - Dynamic shelf background subtraction detects genuine product removal.
-   - Dual-color space skin subtraction (HSV + YCrCb) isolates the product from fingers/wrist.
-   - Product bounding box is strictly anchored to the hand grasp / chest level.
-   - Clamped below shoulder level so it NEVER appears on the customer's head or hair.
-
-3. Verified Shelf Return Detection:
-   - Detects when a customer carrying a product reaches back into the shelf.
-   - Verifies item release / shelf placement -> State: RETURNED_TO_SHELF.
-   - Put Back count (+1), Currently in Hand count (-1).
-   - Product tracking resolves cleanly without false theft alerts.
-
-4. Multi-Stage False-Positive Prevention & Evidence-Based Theft Alert:
-   - Never triggers theft merely because a customer holds a product while shopping.
-   - Multi-stage lifecycle: IN_HAND -> TRACKING_UNCERTAIN -> MISSING_SUSPICIOUS -> THEFT_ALERT.
-   - Theft alerts trigger only upon confirmed concealment with shelf gap remaining, or when
-     a customer exits the view with an unresolved product.
-
-5. Dynamic UI & Alert Banner Management:
-   - Theft alert banner displays for a configurable duration (6.0s) and then reverts
-     smoothly to live store status (Browsing / Holding / Reaching), avoiding persistent red locks.
-   - Telemetry metrics reflect exact counts without duplicate increments.
-   - Activity log records genuine track creation and verified product events.
+Key Capabilities Implemented:
+1. Physical Product Identification:
+   - Detects the physical item removed from the shelf using shelf ROI background differencing.
+   - Extracts the actual physical merchandise template, true pixel dimensions, and color appearance.
+2. True Hand-Product Separation:
+   - Hands and products have distinct visual representations, coordinates, and bounding boxes.
+   - Eliminates fake/artificial product boxes around wrists, palms, or skin blobs.
+   - When the product is occluded by hands, reports "PRODUCT OCCLUDED / UNCERTAIN" rather than
+     drawing a fake box around the wrist.
+3. 11-State Product Lifecycle State Machine:
+   - ON_SHELF -> PICKUP_CANDIDATE -> PICKED_FROM_SHELF -> IN_HAND -> BEING_INSPECTED
+     -> TRACKING_UNCERTAIN -> RETURN_CANDIDATE -> RETURNED_TO_SHELF -> PLACED_IN_BAG
+     -> MISSING_SUSPICIOUS -> THEFT_ALERT.
+4. Idempotent Event Counting:
+   - Confirmed Pickup: Total Picked +1, Currently Held +1 (counted exactly once).
+   - Confirmed Return: Returned to Shelf +1, Currently Held -1 (counted exactly once).
+5. Evidence-Based Theft Verification:
+   - Grace period handling for inspection and occlusion; eliminates premature false theft alarms.
+   - Alert banner auto-reverts after 6.0 seconds so it never locks the screen permanently.
+6. Multi-Person Tracking:
+   - Spatial IoU + normalized centroid association with 60-frame buffer (no duplicate IDs).
+================================================================================
 """
 
-import cv2
-import numpy as np
 import os
 import sys
 import time
 import argparse
-import collections
-
-# Optional ultralytics or onnxruntime
-try:
-    import torch
-    from ultralytics import YOLO
-    HAS_ULTRALYTICS = True
-except ImportError:
-    HAS_ULTRALYTICS = False
-
-import onnxruntime as ort
+import numpy as np
+import cv2
+from collections import deque
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# ──────────────────────────── COLOR PALETTE ────────────────────────────────
-RED    = (40,  40,  235)  # Theft Alert
-AMB    = (0,   185, 255)  # Product Pick / In-Hand (Gold-Yellow)
-ORANGE = (0,   130, 255)  # Uncertain / Suspicious
-GRN    = (50,  205, 50)   # Safe / Returned / Browsing
-CYN    = (230, 210, 0)    # Reaching Shelf / Shelf ROI
-WHT    = (255, 255, 255)
-GRY    = (160, 160, 160)
-DARK   = (22,  22,  26)
-PANEL_BG = (20, 20, 24)
+# ────────────────────────── COLOR PALETTE & STYLING ──────────────────────────
+BG_DARK = (20, 22, 26)
+PANEL_BG = (28, 32, 38)
+ACCENT_BLUE = (235, 145, 30)
+GRN = (70, 200, 90)              # Green: Verified Return / Normal Browsing
+RED = (60, 60, 240)              # Red: Theft Alert
+AMB = (40, 180, 255)             # Amber: Active Product Picked / Holding
+ORANGE = (30, 130, 255)          # Orange: Tracking Uncertain / Missing
+TXT_WHITE = (245, 245, 245)
+TXT_MUTED = (160, 165, 175)
+BORDER_COLOR = (55, 62, 72)
+SHELF_COLOR = (245, 180, 20)      # Yellow: Shelf ROI Polygon
+HAND_COLOR = (255, 190, 0)       # Cyan-Blue: Customer Hand Bounding Box
+PROD_COLOR = (0, 215, 255)       # Gold-Amber: Physical Product Bounding Box
 
-# ──────────────────────── PRODUCT STATE ENUM ───────────────────────────────
+
+# ─────────────────────── 11-STATE PRODUCT LIFECYCLE ─────────────────────────
 class ProductState:
-    ON_SHELF                   = "ON_SHELF"
-    PICKUP_CANDIDATE           = "PICKUP_CANDIDATE"
-    PICKED_FROM_SHELF          = "PICKED_FROM_SHELF"
-    IN_HAND                    = "IN_HAND"
-    TRACKING_UNCERTAIN         = "TRACKING_UNCERTAIN"
-    RETURN_CANDIDATE           = "RETURN_CANDIDATE"
-    RETURNED_TO_SHELF          = "RETURNED_TO_SHELF"
-    PLACED_IN_BAG              = "PLACED_IN_BAG"
-    MISSING_SUSPICIOUS         = "MISSING_SUSPICIOUS"
-    THEFT_ALERT                = "THEFT_ALERT"
+    ON_SHELF = "ON_SHELF"
+    PICKUP_CANDIDATE = "PICKUP_CANDIDATE"
+    PICKED_FROM_SHELF = "PICKED_FROM_SHELF"
+    IN_HAND = "IN_HAND"
+    BEING_INSPECTED = "BEING_INSPECTED"
+    TRACKING_UNCERTAIN = "TRACKING_UNCERTAIN"
+    RETURN_CANDIDATE = "RETURN_CANDIDATE"
+    RETURNED_TO_SHELF = "RETURNED_TO_SHELF"
+    PLACED_IN_BAG = "PLACED_IN_BAG"
+    MISSING_SUSPICIOUS = "MISSING_SUSPICIOUS"
+    THEFT_ALERT = "THEFT_ALERT"
     CUSTOMER_EXITED_UNRESOLVED = "CUSTOMER_EXITED_UNRESOLVED"
 
 
-# ──────────────────────────── MODEL INITIALIZATION ──────────────────────────
+# ────────────────────────── DETECTOR (YOLOv8 & POSE) ─────────────────────────
 def get_device():
-    if HAS_ULTRALYTICS and torch.cuda.is_available():
-        return "cuda"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "0"
+    except Exception:
+        pass
     return "cpu"
 
 
@@ -92,250 +84,220 @@ class DetectorWrapper:
     def __init__(self, model_det="yolov8n.pt", model_pose="yolov8n-pose.pt", imgsz=480):
         self.device = get_device()
         self.imgsz = imgsz
-        self.use_pt = HAS_ULTRALYTICS
         print(f"[Detector] Initializing using device: {self.device.upper()}")
+        
+        det_path = model_det if os.path.isabs(model_det) else os.path.join(HERE, model_det)
+        pose_path = model_pose if os.path.isabs(model_pose) else os.path.join(HERE, model_pose)
 
-        if self.use_pt:
-            print(f"[Detector] Loading PyTorch models via Ultralytics: {model_det}, {model_pose}")
-            pt_det = os.path.join(HERE, model_det) if os.path.exists(os.path.join(HERE, model_det)) else model_det
-            pt_pose = os.path.join(HERE, model_pose) if os.path.exists(os.path.join(HERE, model_pose)) else model_pose
-            self.model_det = YOLO(pt_det)
-            self.model_pose = YOLO(pt_pose)
-        else:
-            print("[Detector] Ultralytics not installed. Loading ONNX models...")
-            onnx_det_path = os.path.join(HERE, "models", "yolov8m.onnx")
-            onnx_pose_path = os.path.join(HERE, "models", "yolov8m-pose.onnx")
-            if not os.path.exists(onnx_det_path) or not os.path.exists(onnx_pose_path):
-                raise FileNotFoundError("Model files not found! Please install ultralytics or provide ONNX models.")
-            so = ort.SessionOptions()
-            so.intra_op_num_threads = min(4, os.cpu_count() or 2)
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if 'CUDAExecutionProvider' in ort.get_available_providers() else ['CPUExecutionProvider']
-            self.sess_det = ort.InferenceSession(onnx_det_path, so, providers=providers)
-            self.sess_pose = ort.InferenceSession(onnx_pose_path, so, providers=providers)
+        from ultralytics import YOLO
+        print(f"[Detector] Loading models: {os.path.basename(det_path)}, {os.path.basename(pose_path)}")
+        self.model_det = YOLO(det_path)
+        self.model_pose = YOLO(pose_path)
 
     def detect_objects_and_pose(self, frame, conf_det=0.30, conf_pose=0.25):
-        """
-        Returns:
-            persons: list of dicts(box=[x1,y1,x2,y2], conf, k=17x3 keypoints)
-            containers: list of dicts(box=[x1,y1,x2,y2], cls, conf, label)
-        """
-        if self.use_pt:
-            pose_res = self.model_pose.predict(frame, conf=conf_pose, imgsz=self.imgsz, device=self.device, verbose=False)[0]
-            persons = []
-            if pose_res.boxes is not None and len(pose_res.boxes) > 0:
-                boxes = pose_res.boxes.xyxy.cpu().numpy()
-                confs = pose_res.boxes.conf.cpu().numpy()
-                kpts = pose_res.keypoints.data.cpu().numpy()
-                for b, c, k in zip(boxes, confs, kpts):
-                    persons.append(dict(box=b.tolist(), conf=float(c), k=k))
-
-            det_res = self.model_det.predict(frame, conf=conf_det, imgsz=self.imgsz, device=self.device, verbose=False)[0]
-            containers = []
-            if det_res.boxes is not None and len(det_res.boxes) > 0:
-                d_boxes = det_res.boxes.xyxy.cpu().numpy()
-                d_confs = det_res.boxes.conf.cpu().numpy()
-                d_cls = det_res.boxes.cls.cpu().numpy().astype(int)
-                CONTAINER_CLASSES = {24: "BACKPACK", 26: "HANDBAG / BAG"}
-                for b, c, cl in zip(d_boxes, d_confs, d_cls):
-                    if cl in CONTAINER_CLASSES:
-                        containers.append(dict(box=b.tolist(), conf=float(c), cls=cl, label=CONTAINER_CLASSES[cl]))
-            return persons, containers
-        else:
-            return self._infer_onnx(frame, conf_det, conf_pose)
-
-    def _infer_onnx(self, frame, conf_det, conf_pose):
-        h, w = frame.shape[:2]
-        input_sz = 640
-        r = input_sz / max(h, w)
-        nh, nw = int(h * r), int(w * r)
-        can = np.full((input_sz, input_sz, 3), 114, np.uint8)
-        can[:nh, :nw] = cv2.resize(frame, (nw, nh))
-        blob = can[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
-
-        out_pose = self.sess_pose.run(None, {"images": blob})[0][0].T
-        sc_p = out_pose[:, 4]
-        mask_p = sc_p > conf_pose
-        out_p, sc_p = out_pose[mask_p], sc_p[mask_p]
         persons = []
-        if len(out_p):
-            bx_p = np.stack([out_p[:, 0] - out_p[:, 2] / 2, out_p[:, 1] - out_p[:, 3] / 2, out_p[:, 2], out_p[:, 3]], 1) / r
-            keep_p = np.array(cv2.dnn.NMSBoxes(bx_p.tolist(), sc_p.tolist(), conf_pose, 0.45)).flatten()
-            for i in keep_p:
-                x, y, bw, bh = bx_p[i]
-                k = out_p[i, 5:].reshape(17, 3).copy()
-                k[:, :2] /= r
-                persons.append(dict(box=[x, y, x + bw, y + bh], conf=float(sc_p[i]), k=k))
-
-        out_det = self.sess_det.run(None, {"images": blob})[0][0].T
-        sc_d = out_det[:, 4:].max(1)
-        mask_d = sc_d > conf_det
-        out_d, sc_d = out_det[mask_d], sc_d[mask_d]
         containers = []
-        if len(out_d):
-            bx_d = np.stack([out_d[:, 0] - out_d[:, 2] / 2, out_d[:, 1] - out_d[:, 3] / 2, out_d[:, 2], out_d[:, 3]], 1) / r
-            cls_d = out_d[:, 4:].argmax(1)
-            keep_d = np.array(cv2.dnn.NMSBoxes(bx_d.tolist(), sc_d.tolist(), conf_det, 0.45)).flatten()
-            CONTAINER_CLASSES = {24: "BACKPACK", 26: "HANDBAG / BAG"}
-            for i in keep_d:
-                c_id = int(cls_d[i])
-                if c_id in CONTAINER_CLASSES:
-                    x, y, bw, bh = bx_d[i]
-                    containers.append(dict(box=[x, y, x + bw, y + bh], conf=float(sc_d[i]), cls=c_id, label=CONTAINER_CLASSES[c_id]))
+
+        res_det = self.model_det.predict(
+            frame, conf=conf_det, device=self.device, imgsz=self.imgsz,
+            verbose=False, classes=[0, 24, 26, 28]  # person, backpack, handbag, suitcase
+        )
+        for r in res_det:
+            boxes = r.boxes
+            if boxes is None:
+                continue
+            for b in boxes:
+                cls_id = int(b.cls[0].item())
+                cf = float(b.conf[0].item())
+                xyxy = b.xyxy[0].cpu().numpy().tolist()
+                lbl = r.names.get(cls_id, str(cls_id)).upper()
+
+                if cls_id == 0:
+                    persons.append({"box": xyxy, "conf": cf, "k": np.zeros((17, 3), dtype=np.float32)})
+                else:
+                    containers.append({"box": xyxy, "conf": cf, "label": lbl})
+
+        if persons:
+            res_pose = self.model_pose.predict(
+                frame, conf=conf_pose, device=self.device, imgsz=self.imgsz,
+                verbose=False, classes=[0]
+            )
+            for r in res_pose:
+                if r.keypoints is None or r.boxes is None:
+                    continue
+                kpts_data = r.keypoints.data.cpu().numpy()
+                pose_boxes = r.boxes.xyxy.cpu().numpy()
+                for pb, pk in zip(pose_boxes, kpts_data):
+                    best_iou, best_idx = 0.25, None
+                    for pi, p_obj in enumerate(persons):
+                        cur_iou = iou(p_obj["box"], pb)
+                        if cur_iou > best_iou:
+                            best_iou = cur_iou
+                            best_idx = pi
+                    if best_idx is not None:
+                        persons[best_idx]["k"] = pk
+
         return persons, containers
 
 
-# ─────────────────────────── GEOMETRY & TRACKING UTILS ──────────────────────
+# ────────────────────────── UTILITY FUNCTIONS ────────────────────────────────
 def iou(b1, b2):
     xA = max(b1[0], b2[0])
     yA = max(b1[1], b2[1])
     xB = min(b1[2], b2[2])
     yB = min(b1[3], b2[3])
-    inter = max(0, xB - xA) * max(0, yB - yA)
-    a1 = max(0, b1[2] - b1[0]) * max(0, b1[3] - b1[1])
-    a2 = max(0, b2[2] - b2[0]) * max(0, b2[3] - b2[1])
-    union = a1 + a2 - inter
-    return inter / union if union > 0 else 0.0
+    inter = max(0.0, xB - xA) * max(0.0, yB - yA)
+    a1 = max(1.0, (b1[2] - b1[0]) * (b1[3] - b1[1]))
+    a2 = max(1.0, (b2[2] - b2[0]) * (b2[3] - b2[1]))
+    return inter / (a1 + a2 - inter)
 
 
 def box_center(b):
-    return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+    return (float((b[0] + b[2]) / 2.0), float((b[1] + b[3]) / 2.0))
 
 
 def point_in_box(pt, box, margin=0):
-    return (box[0] - margin <= pt[0] <= box[2] + margin and
-            box[1] - margin <= pt[1] <= box[3] + margin)
+    return (box[0] - margin <= pt[0] <= box[2] + margin) and (box[1] - margin <= pt[1] <= box[3] + margin)
 
 
 def point_in_poly(pt, poly):
     return cv2.pointPolygonTest(poly, (float(pt[0]), float(pt[1])), False) >= 0
 
 
-# ──────────────────────── SHELF GAP & PRODUCT ISOLATION ─────────────────────
 def detect_shelf_gaps(frame, clean_bg, shelf_mask, threshold=30, min_area=450, person_mask=None):
     """
-    Detects physical product removal gaps on the shelf using background subtraction.
-    Excludes human skin and person bounding boxes to prevent false triggers from hand entry.
-    Returns: list of dicts: [ {"box": [x1,y1,x2,y2], "area": int, "center": (cx, cy)} ]
+    Identifies actual merchandise removed from the shelf ROI by comparing the current frame
+    against the clean shelf background reference, masking out human occlusion.
     """
-    diff = cv2.absdiff(frame, clean_bg)
-    diff_shelf = cv2.bitwise_and(diff, diff, mask=shelf_mask)
-    gray = cv2.cvtColor(diff_shelf, cv2.COLOR_BGR2GRAY)
+    if clean_bg is None or frame is None:
+        return []
 
-    # Detect and remove skin pixels to ensure hands don't appear as shelf gaps
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
-    skin_hsv = cv2.inRange(hsv, (0, 15, 40), (25, 220, 255)) | cv2.inRange(hsv, (165, 15, 40), (180, 220, 255))
-    skin_ycrcb = cv2.inRange(ycrcb, (0, 130, 75), (255, 175, 130))
-    skin = cv2.bitwise_or(skin_hsv, skin_ycrcb)
-    skin = cv2.dilate(skin, np.ones((11, 11), np.uint8))
+    diff = cv2.absdiff(frame, clean_bg)
+    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    masked_diff = cv2.bitwise_and(gray_diff, gray_diff, mask=shelf_mask)
 
     if person_mask is not None:
-        skin = cv2.bitwise_or(skin, person_mask)
+        masked_diff = cv2.bitwise_and(masked_diff, cv2.bitwise_not(person_mask))
 
-    gray_clean = cv2.bitwise_and(gray, cv2.bitwise_not(skin))
-    _, th = cv2.threshold(gray_clean, threshold, 255, cv2.THRESH_BINARY)
-    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    _, thresh = cv2.threshold(masked_diff, threshold, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
-    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     gaps = []
     for c in cnts:
-        area = int(cv2.contourArea(c))
+        area = cv2.contourArea(c)
         if area >= min_area:
             bx, by, bw, bh = cv2.boundingRect(c)
-            cx, cy = bx + bw / 2.0, by + bh / 2.0
             gaps.append({
                 "box": [bx, by, bx + bw, by + bh],
                 "area": area,
-                "center": (cx, cy)
+                "center": (bx + bw / 2.0, by + bh / 2.0)
             })
 
     gaps.sort(key=lambda x: -x["area"])
     return gaps
 
 
-def isolate_product_in_hand(frame, grasp_center, shoulder_y, hip_y, expected_size=(32, 60), search_radius=50):
+# ────────────────────── PHYSICAL PRODUCT TRACKER ────────────────────────────
+class PhysicalProductTracker:
     """
-    Separates the physical product from the customer's hands.
-    - Centers search around the grasp center (between wrists).
-    - Clamped strictly between shoulders and hips so it NEVER jumps to head or feet.
-    - Excludes skin/fingers to tightly bound the physical item.
-    Returns: (found: bool, tight_product_box: [x1, y1, x2, y2])
+    Tracks the actual physical retail product independent of the customer's hands.
+    - Locks appearance template and dimensions from clean shelf background at pickup.
+    - Tracks merchandise using multi-scale normalized cross-correlation.
+    - Never assigns wrist coordinates to the product.
+    - Accurately reports occlusions without synthesizing fake boxes.
     """
-    H, W = frame.shape[:2]
-    gx, gy = int(grasp_center[0]), int(grasp_center[1])
-    
-    # Strictly clamp gy below shoulders and above hips
-    gy_clamped = max(int(shoulder_y + 15), min(int(hip_y + 30), gy))
-
-    x1 = max(0, gx - search_radius)
-    y1 = max(0, gy_clamped - search_radius)
-    x2 = min(W, gx + search_radius)
-    y2 = min(H, gy_clamped + search_radius)
-
-    if (x2 - x1) < 20 or (y2 - y1) < 20:
-        pw, ph = expected_size
-        return False, [gx - pw//2, gy_clamped - ph//2, gx + pw//2, gy_clamped + ph//2]
-
-    patch = frame[y1:y2, x1:x2]
-    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-    ycrcb = cv2.cvtColor(patch, cv2.COLOR_BGR2YCrCb)
-
-    skin_hsv = cv2.inRange(hsv, (0, 15, 35), (25, 230, 255)) | cv2.inRange(hsv, (165, 15, 35), (180, 230, 255))
-    skin_ycrcb = cv2.inRange(ycrcb, (0, 130, 75), (255, 175, 130))
-    skin = cv2.bitwise_or(skin_hsv, skin_ycrcb)
-    skin = cv2.dilate(skin, np.ones((5, 5), np.uint8))
-
-    non_skin = cv2.bitwise_not(skin)
-    non_skin = cv2.morphologyEx(non_skin, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    cnts, _ = cv2.findContours(non_skin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    best_box = None
-    best_area = 0
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if 40 <= area <= (search_radius * search_radius * 1.6):
-            bx, by, bw, bh = cv2.boundingRect(c)
-            ar = bw / max(1.0, bh)
-            if 0.20 <= ar <= 3.5:
-                if area > best_area:
-                    best_area = area
-                    best_box = [x1 + bx, y1 + by, x1 + bx + bw, y1 + by + bh]
-
-    if best_box is not None:
-        return True, best_box
-
-    # Fallback tight box around grasp center (clamped at chest/hand level)
-    pw, ph = expected_size
-    tight_box = [gx - pw//2, gy_clamped - ph//2, gx + pw//2, gy_clamped + ph//2]
-    return False, tight_box
-
-
-# ─────────────────────────── TRACKED PRODUCT CLASS ──────────────────────────
-class TrackedProduct:
-    """
-    Dedicated tracker for the physical retail product (independent of hand).
-    Implements the 11-State Product Lifecycle.
-    """
-    def __init__(self, prod_id, customer_id, initial_box, shelf_origin_box, t_pick, template=None, color_sig=None):
+    def __init__(self, prod_id, customer_id, shelf_box, template, t_pick):
         self.id = prod_id
         self.customer_id = customer_id
-        self.box = list(initial_box)          # Tight product bbox [x1, y1, x2, y2]
-        self.shelf_origin_box = list(shelf_origin_box) if shelf_origin_box else None
-        self.origin_center = box_center(self.shelf_origin_box) if shelf_origin_box else None
+        self.shelf_box = list(shelf_box)
+        self.current_box = list(shelf_box)   # [x1, y1, x2, y2]
+        self.template = template.copy() if template is not None else None
         self.t_pick = t_pick
         self.t_last_seen = t_pick
         self.state = ProductState.PICKED_FROM_SHELF
-        self.template = template
-        self.color_sig = color_sig
-        self.expected_size = (max(24, self.box[2] - self.box[0]), max(35, self.box[3] - self.box[1]))
-
-        # State counters
-        self.uncertain_frames = 0
-        self.missing_frames = 0
+        self.confidence = 1.0
+        self.is_visually_verified = True
+        self.occluded_frames = 0
         self.return_candidate_frames = 0
         self.bag_drop_candidate_frames = 0
-        self.final_logged = False
+        self.orig_w = max(24, shelf_box[2] - shelf_box[0])
+        self.orig_h = max(35, shelf_box[3] - shelf_box[1])
+
+    def update_visual_tracking(self, frame, customer_box, wrist_pts):
+        """
+        Visually searches for and tracks the physical merchandise across the customer's
+        hands and upper body region. Separates product from hand.
+        """
+        if self.template is None or self.template.size == 0:
+            return False
+
+        H, W = frame.shape[:2]
+        cb = customer_box
+        ph = max(20.0, cb[3] - cb[1])
+
+        # Center search near wrists if visible, else customer chest/torso
+        if wrist_pts:
+            cx = float(np.mean([p[0] for p in wrist_pts]))
+            cy = float(np.mean([p[1] for p in wrist_pts]))
+        else:
+            cx = (cb[0] + cb[2]) / 2.0
+            cy = cb[1] + 0.35 * ph
+
+        search_rad = int(0.18 * ph)
+        sx1 = max(0, int(cx - search_rad))
+        sy1 = max(0, int(cy - search_rad))
+        sx2 = min(W, int(cx + search_rad))
+        sy2 = min(H, int(cy + search_rad))
+
+        if (sx2 - sx1) < (self.orig_w + 10) or (sy2 - sy1) < (self.orig_h + 10):
+            self.is_visually_verified = False
+            return False
+
+        search_patch = frame[sy1:sy2, sx1:sx2]
+        sw_h, sw_w = search_patch.shape[:2]
+
+        best_val = -1.0
+        best_box = None
+
+        # Multi-scale normalized cross-correlation
+        for scale in [0.75, 0.85, 1.0, 1.15]:
+            tw = int(self.orig_w * scale)
+            th = int(self.orig_h * scale)
+            if tw >= 16 and th >= 25 and tw < sw_w and th < sw_h:
+                t_scaled = cv2.resize(self.template, (tw, th))
+                res = cv2.matchTemplate(search_patch, t_scaled, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                if max_val > best_val:
+                    best_val = max_val
+                    best_box = [
+                        sx1 + max_loc[0],
+                        sy1 + max_loc[1],
+                        sx1 + max_loc[0] + tw,
+                        sy1 + max_loc[1] + th
+                    ]
+
+        # Verification threshold: Product is visually verified
+        if best_val >= 0.32 and best_box is not None:
+            # Smooth bounding box
+            self.current_box = [
+                int(0.65 * self.current_box[0] + 0.35 * best_box[0]),
+                int(0.65 * self.current_box[1] + 0.35 * best_box[1]),
+                int(0.65 * self.current_box[2] + 0.35 * best_box[2]),
+                int(0.65 * self.current_box[3] + 0.35 * best_box[3]),
+            ]
+            self.confidence = float(best_val)
+            self.is_visually_verified = True
+            self.occluded_frames = 0
+            return True
+        else:
+            # Product is occluded by fingers/body or customer is turned
+            self.confidence = float(max(0.0, best_val))
+            self.is_visually_verified = False
+            self.occluded_frames += 1
+            return False
 
 
 # ─────────────────────────── TRACKED CUSTOMER CLASS ─────────────────────────
@@ -355,11 +317,9 @@ class CustomerTrack:
         self.hands_in_shelf = False
         self.last_shelf_reach_time = -99.0
         self.hand_in_shelf_frames = 0
-        self.active_product = None
+        self.active_product = None        # PhysicalProductTracker instance
         self.completed_products = []
         self.theft_flagged = False
-
-        # Active bag detection (only if currently detected, no ghost projection)
         self.bag_box = None
         self.bag_type = "BAG"
 
@@ -373,18 +333,15 @@ def draw_shelf_roi(video_path: str):
     if not ret or frame_native is None:
         raise RuntimeError(f"Cannot read frame from {video_path}")
 
-    H_nat, W_nat = frame_native.shape[:2]
-    max_w, max_h = 1280, 720
-    scale = min(max_w / W_nat, max_h / H_nat, 1.0)
-    dw, dh = int(W_nat * scale), int(H_nat * scale)
-    sx, sy = dw / W_nat, dh / H_nat
+    H, W = frame_native.shape[:2]
+    dw, dh = 1280, 720
+    sx, sy = dw / W, dh / H
     disp = cv2.resize(frame_native, (dw, dh))
 
     polys = []
     cur = []
     mouse = [-1, -1]
 
-    # Pre-configured default shelves for known benchmark videos
     vname = os.path.basename(video_path).lower()
     default_shelves = []
     if "vid2" in vname:
@@ -401,47 +358,28 @@ def draw_shelf_roi(video_path: str):
                 polys.append(list(cur))
                 cur.clear()
                 print(f"[Shelf ROI] Shelf #{len(polys)} captured.")
-            else:
-                print("Click at least 3 points to complete a shelf polygon.")
 
     win = "Draw Shelf ROI  |  L-Click: Add Point  |  R-Click: Close  |  D: Default  |  Enter: Run"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, dw, dh)
     cv2.setMouseCallback(win, mouse_callback)
 
-    print("\n" + "="*65)
-    print(" STEP 1: DEFINE SHELF ROI")
-    print(" • Left-Click  : Place corner of shelf polygon")
-    print(" • Right-Click : Close current shelf polygon")
-    print(" • D           : Load Default Preset for this video")
-    print(" • Z           : Undo point")
-    print(" • R           : Reset all polygons")
-    print(" • Enter / S   : Save Shelf Background & Start Detection")
-    print("="*65 + "\n")
-
     while True:
         vis = disp.copy()
-        for i, poly in enumerate(polys):
+        for poly in polys:
             pts = np.array(poly, np.int32)
-            ov = vis.copy()
-            cv2.fillPoly(ov, [pts], (0, 220, 220))
-            cv2.addWeighted(ov, 0.22, vis, 0.78, 0, vis)
-            cv2.polylines(vis, [pts], True, (0, 255, 255), 2, cv2.LINE_AA)
-            cx_ = int(pts[:, 0].mean())
-            cy_ = int(pts[:, 1].mean())
-            cv2.putText(vis, f"Shelf {i+1}", (cx_ - 26, cy_), cv2.FONT_HERSHEY_DUPLEX, 0.65, (0, 255, 255), 2)
+            cv2.polylines(vis, [pts], True, (0, 220, 255), 2)
+            overlay = vis.copy()
+            cv2.fillPoly(overlay, [pts], (0, 180, 255))
+            cv2.addWeighted(overlay, 0.25, vis, 0.75, 0, vis)
 
-        if len(cur) >= 2:
-            cv2.polylines(vis, [np.array(cur, np.int32)], False, (0, 200, 255), 2, cv2.LINE_AA)
-        for pt in cur:
-            cv2.circle(vis, pt, 5, (0, 200, 255), -1)
-        if cur and mouse[0] >= 0:
-            cv2.line(vis, cur[-1], tuple(mouse), (0, 200, 255), 1, cv2.LINE_AA)
-
-        cv2.putText(vis, f"Shelves defined: {len(polys)} | Points in progress: {len(cur)}", (14, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 255), 2)
-        cv2.putText(vis, "L-Click: Add | R-Click: Close | D: Default Preset | Enter: Run | Z: Undo | R: Reset", (14, 54),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (230, 230, 230), 1)
+        if len(cur) > 0:
+            for pt in cur:
+                cv2.circle(vis, pt, 4, (0, 255, 0), -1)
+            for i in range(len(cur) - 1):
+                cv2.line(vis, cur[i], cur[i+1], (0, 255, 0), 2)
+            if mouse[0] >= 0:
+                cv2.line(vis, cur[-1], tuple(mouse), (0, 255, 255), 1)
 
         cv2.imshow(win, vis)
         key = cv2.waitKey(20) & 0xFF
@@ -455,8 +393,6 @@ def draw_shelf_roi(video_path: str):
                 polys = [list(poly) for poly in default_shelves]
                 cur.clear()
                 print(f"[Shelf ROI] Loaded default preset with {len(polys)} shelf polygon(s).")
-            else:
-                print("No default preset configured for this video.")
         elif key in (13, ord('s'), ord('S'), 32):
             if len(cur) >= 3:
                 polys.append(list(cur))
@@ -465,10 +401,7 @@ def draw_shelf_roi(video_path: str):
                 break
             elif default_shelves:
                 polys = [list(poly) for poly in default_shelves]
-                print(f"[Shelf ROI] Using default preset shelf.")
                 break
-            else:
-                print("Please draw at least one shelf polygon before continuing.")
         elif key in (27, ord('q'), ord('Q')):
             cv2.destroyAllWindows()
             sys.exit(0)
@@ -486,9 +419,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Responsive window rendering
     S = 720.0 / H
     vw = int(W * S)
     PW = 390
@@ -501,13 +432,12 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
         sy_render = S
     total_w = vw + PW
 
-    # Build Shelf Polygons and Masks
     shelf_np = [np.array(p, np.int32) for p in shelf_polygons]
     shelf_mask = np.zeros((H, W), dtype=np.uint8)
     for sp in shelf_np:
         cv2.fillPoly(shelf_mask, [sp], 255)
 
-    # Capture initial Clean Shelf ROI Background (Frame 5)
+    # Initialize clean reference shelf background
     cap.set(cv2.CAP_PROP_POS_FRAMES, 5)
     ret, clean_shelf_bg = cap.read()
     if not ret:
@@ -516,12 +446,10 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     print("[Pipeline] Clean shelf ROI background initialized successfully.")
 
-    # Detector
     model_det = f"yolov8{model_size}.pt"
     model_pose = f"yolov8{model_size}-pose.pt"
     detector = DetectorWrapper(model_det=model_det, model_pose=model_pose, imgsz=480)
 
-    # Output video writer
     out_file = os.path.join(HERE, "out_theft_v2.mp4")
     wr = cv2.VideoWriter(out_file, cv2.VideoWriter_fourcc(*"mp4v"), fps, (total_w, 720)) if save else None
 
@@ -529,23 +457,22 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
         cv2.namedWindow("AI Retail Theft Detection v2", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("AI Retail Theft Detection v2", total_w, 720)
 
-    # Multi-person tracks and event metrics
     people = {}
     next_customer_id = 1
     events = []
     accounted_shelf_gaps = []
 
-    # Accurate 7-Metric Event Counters (Section 9)
+    # Accurate 7-Metric Dashboard
     counts = dict(
-        total_picked=0,          # Total Products Picked
-        currently_held=0,        # Currently in Hand
-        returned_to_shelf=0,     # Products Returned to Shelf
-        placed_in_bag=0,         # Products Placed in Bag
-        suspicious_missing=0,    # Suspicious Missing Products
-        theft_alerts=0           # Theft Alerts
+        customers_in_view=0,
+        total_picked=0,
+        currently_held=0,
+        returned_to_shelf=0,
+        placed_in_bag=0,
+        suspicious_missing=0,
+        theft_alerts=0
     )
 
-    # Alert banner management (Reverts after 6.0 seconds so it does not permanently lock)
     active_theft_banner_until_t = 0.0
 
     def log_event(t, text, col):
@@ -556,9 +483,6 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
     idx = 0
     t_prev = time.time()
     fps_disp = 0.0
-
-    print("\n[Pipeline] Detection running... (Press 'Q' to stop)\n")
-
     cached_persons = []
     cached_containers = []
 
@@ -571,7 +495,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
         idx += 1
         t = idx / fps
 
-        # ──────────────── 1. RUN YOLO INFERENCE (WITH FRAME SKIPPING) ────────────────
+        # 1. RUN YOLO INFERENCE
         if idx % (skip_frames + 1) == 1 or not cached_persons:
             persons_det, containers_det = detector.detect_objects_and_pose(frame, conf_det=0.30, conf_pose=0.25)
             cached_persons = persons_det
@@ -580,7 +504,7 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
             persons_det = cached_persons
             containers_det = cached_containers
 
-        # ──────────────── 2. SHELF GAP ANALYSIS (GLOBAL FOR FRAME) ────────────────
+        # 2. SHELF GAP ANALYSIS (GLOBAL FOR FRAME)
         person_mask = np.zeros((H, W), dtype=np.uint8)
         for pd in persons_det:
             pb = pd["box"]
@@ -594,13 +518,12 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
             person_mask=person_shelf_mask
         )
 
-        # ──────────────── 3. PERSISTENT MULTI-PERSON TRACKING ─────────────────────
+        # 3. PERSISTENT MULTI-PERSON TRACKING
         matched_det_indices = set()
         active_customer_tracks = []
 
-        # Sort existing tracks by ID
         for cid, trk in sorted(people.items()):
-            if trk.lost > 60:  # 2.5-3.0 second buffer for occlusion
+            if trk.lost > 60:
                 continue
 
             tcx, tcy = (trk.box[0] + trk.box[2]) / 2.0, (trk.box[1] + trk.box[3]) / 2.0
@@ -629,15 +552,14 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                 active_customer_tracks.append(trk)
             else:
                 trk.lost += 1
-                if trk.lost <= 15:  # Keep briefly active during momentary detector miss
+                if trk.lost <= 15:
                     active_customer_tracks.append(trk)
 
-        # Register genuine new customers only
+        # Register genuine new customers
         for j, d in enumerate(persons_det):
             if j not in matched_det_indices:
                 db = d["box"]
                 dcx, dcy = (db[0] + db[2]) / 2.0, (db[1] + db[3]) / 2.0
-                # Ensure it's not a fragmented duplicate of an existing active person
                 is_duplicate = False
                 for trk in active_customer_tracks:
                     tcx, tcy = (trk.box[0] + trk.box[2]) / 2.0, (trk.box[1] + trk.box[3]) / 2.0
@@ -653,43 +575,39 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                     log_event(t, f"Customer #{next_customer_id} entered camera view", GRN)
                     next_customer_id += 1
 
-        # ──────────────── 4. PROCESS EACH CUSTOMER'S INTERACTIONS ──────────────────
+        counts["customers_in_view"] = len(active_customer_tracks)
+
+        # 4. PROCESS INTERACTIONS FOR EACH ACTIVE CUSTOMER
         for p in active_customer_tracks:
             b = p.box
             k = p.kpts
             ph = max(1.0, b[3] - b[1])
             reach_margin = int(0.06 * ph)
 
-            # Keypoints: shoulders(5,6), elbows(7,8), wrists(9,10), hips(11,12)
             ls, rs = k[5], k[6]
-            le, re = k[7], k[8]
-            lw, rw = k[9], k[10]
             lh, rh = k[11], k[12]
-
             sh_valid = [q for q in (ls, rs) if q[2] > 0.15]
             hip_valid = [q for q in (lh, rh) if q[2] > 0.15]
             sy_mean = float(np.mean([q[1] for q in sh_valid])) if sh_valid else b[1] + 0.18 * ph
             hy_mean = float(np.mean([q[1] for q in hip_valid])) if hip_valid else sy_mean + 0.42 * ph
 
-            # Active Bag Detection (NO phantom/ghost projection)
+            # Active Bag Detection
             p.bag_box = None
             for c in containers_det:
                 cb = c["box"]
                 ccx, ccy = box_center(cb)
-                # Ensure bag is NOT on the shelf ROI
                 if not any(point_in_poly((ccx, ccy), s) for s in shelf_np):
-                    # Bag must be within customer upper torso/shoulder bounds
                     if (b[0] - 0.20 * ph) <= ccx <= (b[2] + 0.20 * ph) and sy_mean - 0.15 * ph <= ccy <= hy_mean + 0.25 * ph:
                         p.bag_box = [int(cb[0]), int(cb[1]), int(cb[2]), int(cb[3])]
                         p.bag_type = c.get("label", "BAG")
                         break
 
-            # Hand & Shelf Interaction
+            # Explicit Hand Detection (Wrists)
             hand_in_shelf = False
             wrist_pts_valid = []
             for w_idx in (9, 10):
                 wkp = k[w_idx]
-                if wkp[2] > 0.15:
+                if wkp[2] > 0.18:
                     w_pt = (float(wkp[0]), float(wkp[1]))
                     wrist_pts_valid.append(w_pt)
                     in_s = any(cv2.pointPolygonTest(s, w_pt, True) >= -reach_margin for s in shelf_np)
@@ -705,22 +623,11 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
 
             time_since_shelf_reach = t - p.last_shelf_reach_time
 
-            # Calculate Hand Grasp Center (between wrists, clamped at hand/chest level)
-            if wrist_pts_valid:
-                gc_x = float(np.mean([pt[0] for pt in wrist_pts_valid]))
-                gc_y = float(np.mean([pt[1] for pt in wrist_pts_valid]))
-            else:
-                gc_x = (b[0] + b[2]) / 2.0
-                gc_y = sy_mean + 0.25 * (hy_mean - sy_mean)
-            grasp_center = (gc_x, gc_y)
-
-            # ──────────────── 5. PRODUCT LIFECYCLE STATE MACHINE ────────────────
+            # 5. PRODUCT LIFECYCLE & PHYSICAL TRACKING
             if p.active_product is None:
-                # ── STAGE A: PICKUP DETECTION ──
-                # Condition: Hand was at shelf recently (within 1.5s) AND pulled back/away,
-                # AND a new significant shelf gap exists that hasn't been picked yet!
+                # ── STAGE A: PHYSICAL PRODUCT PICKUP CONFIRMATION ──
+                # Confirmed when: Hand was at shelf AND pulled away AND a genuine gap formed!
                 hand_reached_shelf = hand_in_shelf or (time_since_shelf_reach <= 1.5)
-
                 if hand_reached_shelf and shelf_gaps and not hand_in_shelf:
                     for g in shelf_gaps:
                         gcx, gcy = g["center"]
@@ -732,96 +639,73 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                                     break
 
                             if is_new_gap:
-                                # Genuine pickup event!
                                 prod_id = counts["total_picked"] + 1
                                 accounted_shelf_gaps.append((gcx, gcy))
                                 gx1, gy1, gx2, gy2 = g["box"]
-                                shelf_crop = clean_shelf_bg[gy1:gy2, gx1:gx2].copy()
-                                color_sig = shelf_crop.mean(axis=(0, 1)) if shelf_crop.size > 0 else None
+                                
+                                # Extract physical merchandise template from reference background
+                                prod_crop = clean_shelf_bg[gy1:gy2, gx1:gx2].copy()
+                                item_w = gx2 - gx1
+                                item_h = gy2 - gy1
 
-                                p.active_product = TrackedProduct(
+                                # Initialize dedicated Physical Product Tracker
+                                p.active_product = PhysicalProductTracker(
                                     prod_id=prod_id,
                                     customer_id=p.id,
-                                    initial_box=g["box"],
-                                    shelf_origin_box=g["box"],
-                                    t_pick=t,
-                                    template=shelf_crop,
-                                    color_sig=color_sig
+                                    shelf_box=g["box"],
+                                    template=prod_crop,
+                                    t_pick=t
                                 )
                                 p.active_product.state = ProductState.PICKED_FROM_SHELF
                                 p.state = "HOLDING PRODUCT"
                                 counts["total_picked"] += 1
                                 counts["currently_held"] += 1
-                                log_event(t, f"Customer #{p.id}: Product #{prod_id} PICKED from shelf [Shelf Gap: {g['area']}px]", AMB)
+                                log_event(t, f"Customer #{p.id}: Product #{prod_id} PICKED from shelf [Item: {item_w}x{item_h}px]", AMB)
                                 break
 
-                # Customer UI State when not holding a product
                 if hand_in_shelf:
                     p.state = "REACHING SHELF"
                 elif not p.theft_flagged:
                     p.state = "BROWSING"
 
             else:
-                # ── STAGE B: PRODUCT IS ACTIVELY TRACKED ──
+                # ── STAGE B: PHYSICAL MERCHANDISE VISUAL TRACKING ──
                 prod = p.active_product
-
-                # Isolate product in grasp, strictly clamped below shoulders and above hips
-                found_in_hand, tight_prod_box = isolate_product_in_hand(
-                    frame, grasp_center,
-                    shoulder_y=sy_mean, hip_y=hy_mean,
-                    expected_size=prod.expected_size,
-                    search_radius=int(0.14 * ph)
+                
+                # Update visual tracking of actual physical item (NOT hand)
+                visually_verified = prod.update_visual_tracking(frame, p.box, wrist_pts_valid)
+                
+                # Check customer posture: inspecting in front of chest
+                wrists_at_chest = any(
+                    (b[0] - 0.15 * ph) <= w[0] <= (b[2] + 0.15 * ph) and
+                    (sy_mean - 0.10 * ph) <= w[1] <= (hy_mean + 0.25 * ph)
+                    for w in wrist_pts_valid
                 )
 
-                if found_in_hand and tight_prod_box is not None:
-                    prod.box = [
-                        int(0.60 * prod.box[0] + 0.40 * tight_prod_box[0]),
-                        int(0.60 * prod.box[1] + 0.40 * tight_prod_box[1]),
-                        int(0.60 * prod.box[2] + 0.40 * tight_prod_box[2]),
-                        int(0.60 * prod.box[3] + 0.40 * tight_prod_box[3]),
-                    ]
+                if visually_verified:
                     prod.t_last_seen = t
                     prod.state = ProductState.IN_HAND
                     p.state = "HOLDING PRODUCT"
-                    prod.uncertain_frames = 0
+                elif wrists_at_chest:
+                    # Physically held in grasp, visually occluded by fingers/palms
+                    prod.t_last_seen = t
+                    prod.state = ProductState.BEING_INSPECTED
+                    p.state = "HOLDING PRODUCT"
                 else:
-                    # Anchor product box to grasp center at hand/chest level (NEVER on head)
-                    pw, ph_prod = prod.expected_size
-                    clamped_gy = max(int(sy_mean + 15), min(int(hy_mean + 30), int(grasp_center[1])))
-                    target_box = [int(grasp_center[0] - pw/2), int(clamped_gy - ph_prod/2),
-                                  int(grasp_center[0] + pw/2), int(clamped_gy + ph_prod/2)]
-                    prod.box = [
-                        int(0.60 * prod.box[0] + 0.40 * target_box[0]),
-                        int(0.60 * prod.box[1] + 0.40 * target_box[1]),
-                        int(0.60 * prod.box[2] + 0.40 * target_box[2]),
-                        int(0.60 * prod.box[3] + 0.40 * target_box[3]),
-                    ]
-                    # If customer is holding wrists in front of chest/torso, customer is actively inspecting product
-                    wrists_at_chest = any(
-                        (b[0] - 0.15 * ph) <= w[0] <= (b[2] + 0.15 * ph) and
-                        (sy_mean - 0.10 * ph) <= w[1] <= (hy_mean + 0.25 * ph)
-                        for w in wrist_pts_valid
-                    )
-                    if wrists_at_chest:
-                        prod.t_last_seen = t
-                        prod.state = ProductState.IN_HAND
-                        p.state = "HOLDING PRODUCT"
-                        prod.uncertain_frames = 0
+                    prod.state = ProductState.TRACKING_UNCERTAIN
+                    p.state = "PRODUCT OCCLUDED / UNCERTAIN"
 
-                # ── STAGE C: CHECK PRODUCT RESOLUTIONS (RETURN, BAG, THEFT) ──
+                # ── STAGE C: PRODUCT RESOLUTIONS (RETURN, BAG, THEFT) ──
                 # Condition 1: RETURN TO SHELF
-                # Customer carrying product reaches back to shelf ROI
                 hand_back_on_shelf = hand_in_shelf or any(
                     cv2.pointPolygonTest(s, w_pt, True) >= -reach_margin
                     for s in shelf_np
                     for w_pt in wrist_pts_valid
                 )
 
-                # Check if product is returned (placed on shelf or gap restored)
                 if hand_back_on_shelf:
                     prod.state = ProductState.RETURN_CANDIDATE
                     prod.return_candidate_frames += 1
-                    # After reaching into shelf with product, confirm return when hand lingers or pulls away
                     if prod.return_candidate_frames >= 4:
                         prod.state = ProductState.RETURNED_TO_SHELF
                         p.state = "PUT BACK ON SHELF"
@@ -830,13 +714,15 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                         if counts["suspicious_missing"] > 0:
                             counts["suspicious_missing"] -= 1
                         log_event(t, f"Customer #{p.id}: Product #{prod.id} RETURNED TO SHELF [Put Back: {counts['returned_to_shelf']}]", GRN)
-                        # Remove from accounted gaps
-                        if prod.origin_center is not None:
-                            accounted_shelf_gaps = [ag for ag in accounted_shelf_gaps if np.hypot(ag[0]-prod.origin_center[0], ag[1]-prod.origin_center[1]) >= 70]
+                        
+                        # Clear gap from accounted list
+                        orig_c = box_center(prod.shelf_box)
+                        accounted_shelf_gaps = [ag for ag in accounted_shelf_gaps if np.hypot(ag[0]-orig_c[0], ag[1]-orig_c[1]) >= 70]
+                        
                         p.completed_products.append(prod)
                         p.active_product = None
 
-                # Condition 2: DELIBERATE BAG PLACEMENT
+                # Condition 2: BAG PLACEMENT (SAFE)
                 elif p.bag_box is not None and any(point_in_box(w, p.bag_box, margin=5) for w in wrist_pts_valid):
                     prod.bag_drop_candidate_frames += 1
                     if prod.bag_drop_candidate_frames >= 12:
@@ -850,18 +736,9 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                         p.completed_products.append(prod)
                         p.active_product = None
 
+                # Condition 3: EVIDENCE-BASED THEFT
                 else:
-                    # Condition 3: EVIDENCE-BASED THEFT / CONCEALMENT
                     time_unseen = t - prod.t_last_seen
-                    time_held = t - prod.t_pick
-
-                    # Step 1: Temporary occlusion while shopping (Normal behavior)
-                    if time_unseen > 1.5:
-                        if prod.state != ProductState.TRACKING_UNCERTAIN and prod.state != ProductState.MISSING_SUSPICIOUS:
-                            prod.state = ProductState.TRACKING_UNCERTAIN
-                            p.state = "TRACKING UNCERTAIN"
-
-                    # Step 2: Extended disappearance / missing from grasp
                     if time_unseen > 4.0:
                         if prod.state != ProductState.MISSING_SUSPICIOUS:
                             prod.state = ProductState.MISSING_SUSPICIOUS
@@ -869,8 +746,6 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                             counts["suspicious_missing"] += 1
                             log_event(t, f"Customer #{p.id}: Product #{prod.id} TRACKING UNCERTAIN / MISSING", ORANGE)
 
-                    # Step 3: Confirmed Theft Alert (Requires sustained concealment for > 15s without return,
-                    # or walking away from shelf with item hidden)
                     if time_unseen > 15.0 and not hand_in_shelf:
                         prod.state = ProductState.THEFT_ALERT
                         p.theft_flagged = True
@@ -879,213 +754,143 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                         counts["currently_held"] = max(0, counts["currently_held"] - 1)
                         if counts["suspicious_missing"] > 0:
                             counts["suspicious_missing"] -= 1
-                        active_theft_banner_until_t = t + 6.0  # Show banner for 6 seconds
+                        active_theft_banner_until_t = t + 6.0
                         log_event(t, f"Customer #{p.id}: 🚨 THEFT ALERT! Product #{prod.id} MISSING (NOT RETURNED TO SHELF)", RED)
                         p.completed_products.append(prod)
                         p.active_product = None
 
-        # ──────────────── 5. EXITED CUSTOMER RESOLUTION ───────────────────────────
+        # Exited customer check
         for cid, p in list(people.items()):
             if t - p.t > 2.5 and p.lost > 60:
                 if p.active_product is not None:
                     prod = p.active_product
                     prod.state = ProductState.CUSTOMER_EXITED_UNRESOLVED
                     counts["currently_held"] = max(0, counts["currently_held"] - 1)
-                    counts["suspicious_missing"] += 1
+                    counts["theft_alerts"] += 1
                     active_theft_banner_until_t = t + 6.0
-                    log_event(t, f"Customer #{p.id} EXITED CAMERA VIEW with unresolved product #{prod.id}", ORANGE)
+                    log_event(t, f"Customer #{p.id} EXITED AISLE WITH UNPAID PRODUCT #{prod.id}!", RED)
                     p.completed_products.append(prod)
                     p.active_product = None
 
-        # ──────────────── 6. RENDER OPENCV DETECTION HUD ──────────────────────────
-        canvas = np.zeros((720, total_w, 3), np.uint8)
-        canvas[:] = DARK
+        # 6. RENDER VIDEO WITH STRICT HAND & PRODUCT SEPARATION
+        render_frame = cv2.resize(frame, (vw, 720))
 
-        # Main video render
-        canvas[:, :vw] = cv2.resize(frame, (vw, 720))
+        # Draw shelf overlay
+        for sp in shelf_polygons:
+            poly_scaled = np.array([[(int(pt[0] * sx_render), int(pt[1] * sy_render)) for pt in sp]], np.int32)
+            cv2.polylines(render_frame, poly_scaled, True, SHELF_COLOR, 2)
+            cv2.putText(render_frame, "ACTIVE SHELF ROI [SHELF #1]", (poly_scaled[0][0][0] + 8, poly_scaled[0][0][1] + 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, SHELF_COLOR, 2)
 
-        # Draw Shelf Polygons
-        for s in shelf_np:
-            pts = np.stack([s[:, 0] * sx_render, s[:, 1] * sy_render], axis=1).astype(np.int32)
-            ov = canvas.copy()
-            cv2.fillPoly(ov, [pts], (0, 180, 220))
-            cv2.addWeighted(ov, 0.16, canvas, 0.84, 0, canvas)
-            cv2.polylines(canvas, [pts], True, (0, 240, 240), 2, cv2.LINE_AA)
-            cx_ = int(pts[:, 0].mean())
-            cy_ = int(pts[:, 1].mean())
-            cv2.putText(canvas, "SHELF ROI", (cx_ - 38, cy_), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 240, 240), 2, cv2.LINE_AA)
-
-        # Draw detected Shelf Gap indicators (Orange rectangles on the shelf)
-        for g in shelf_gaps:
-            gx1 = int(g["box"][0] * sx_render)
-            gy1 = int(g["box"][1] * sy_render)
-            gx2 = int(g["box"][2] * sx_render)
-            gy2 = int(g["box"][3] * sy_render)
-            cv2.rectangle(canvas, (gx1, gy1), (gx2, gy2), (0, 100, 255), 2)
-            cv2.putText(canvas, f"GAP {g['area']}px", (gx1, max(14, gy1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 120, 255), 1, cv2.LINE_AA)
-
-        # Draw Visual Elements for Customers
+        # Draw customers, hands, and products
         for p in active_customer_tracks:
-            b = p.box
-            k = p.kpts
-            b_sc = [int(b[0] * sx_render), int(b[1] * sy_render), int(b[2] * sx_render), int(b[3] * sy_render)]
+            b_sc = [int(p.box[0] * sx_render), int(p.box[1] * sy_render),
+                    int(p.box[2] * sx_render), int(p.box[3] * sy_render)]
+            box_col = RED if p.theft_flagged else (AMB if p.active_product is not None else GRN)
+            cv2.rectangle(render_frame, (b_sc[0], b_sc[1]), (b_sc[2], b_sc[3]), box_col, 2)
 
-            # Customer bounding box color based on state
-            if "THEFT" in p.state:
-                box_col = RED
-            elif "SAFE" in p.state or "PUT BACK" in p.state:
-                box_col = GRN
-            elif "HOLDING" in p.state:
-                box_col = AMB
-            elif "UNCERTAIN" in p.state or "MISSING" in p.state:
-                box_col = ORANGE
-            elif "REACHING" in p.state:
-                box_col = CYN
-            else:
-                box_col = GRY
+            cust_label = f"CUSTOMER #{p.id} | {p.state}"
+            cv2.putText(render_frame, cust_label, (b_sc[0], max(20, b_sc[1] - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, box_col, 2)
 
-            cv2.rectangle(canvas, (b_sc[0], b_sc[1]), (b_sc[2], b_sc[3]), box_col, 2)
-            cv2.putText(canvas, f"CUSTOMER #{p.id} [{p.state}]", (b_sc[0], max(18, b_sc[1] - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, box_col, 2, cv2.LINE_AA)
+            # Draw Customer HAND Bounding Boxes (Distinct from Product)
+            for widx, wname in ((9, "L"), (10, "R")):
+                wkp = p.kpts[widx]
+                if wkp[2] > 0.18:
+                    wx_sc, wy_sc = int(wkp[0] * sx_render), int(wkp[1] * sy_render)
+                    # Hand bounding box
+                    cv2.rectangle(render_frame, (wx_sc - 18, wy_sc - 18), (wx_sc + 18, wy_sc + 18), HAND_COLOR, 2)
+                    cv2.putText(render_frame, f"HAND [{wname}] | CUST #{p.id}", (wx_sc - 35, max(14, wy_sc - 22)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.38, HAND_COLOR, 1)
 
-            # Draw Customer Hands as clean indicator dots (NEVER labeled as product)
-            for w_idx in (9, 10):
-                wkp = k[w_idx]
-                if wkp[2] > 0.15:
-                    wx = int(wkp[0] * sx_render)
-                    wy = int(wkp[1] * sy_render)
-                    cv2.circle(canvas, (wx, wy), 4, (200, 240, 255), -1)
-                    cv2.circle(canvas, (wx, wy), 6, (100, 100, 100), 1)
-
-            # Draw tracked Shoulder Bag / Bag ONLY if actively detected
-            if p.bag_box is not None:
-                bx1r = int(p.bag_box[0] * sx_render)
-                by1r = int(p.bag_box[1] * sy_render)
-                bx2r = int(p.bag_box[2] * sx_render)
-                by2r = int(p.bag_box[3] * sy_render)
-
-                bag_ov = canvas.copy()
-                cv2.rectangle(bag_ov, (bx1r, by1r), (bx2r, by2r), (0, 200, 100), -1)
-                cv2.addWeighted(bag_ov, 0.20, canvas, 0.80, 0, canvas)
-                cv2.rectangle(canvas, (bx1r, by1r), (bx2r, by2r), (50, 220, 120), 2)
-                cv2.putText(canvas, f"[{p.bag_type}]", (bx1r, max(14, by1r - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (50, 220, 120), 1, cv2.LINE_AA)
-
-            # Draw the ACTUAL PRODUCT BOX (Tight bounding box around the physical product)
-            if p.active_product is not None and p.active_product.box is not None:
+            # Draw ACTUAL PHYSICAL PRODUCT Bounding Box (Distinct from Hands)
+            if p.active_product is not None:
                 ap = p.active_product
-                px1 = int(ap.box[0] * sx_render)
-                py1 = int(ap.box[1] * sy_render)
-                px2 = int(ap.box[2] * sx_render)
-                py2 = int(ap.box[3] * sy_render)
+                if ap.is_visually_verified:
+                    pb = ap.current_box
+                    pb_sc = [int(pb[0] * sx_render), int(pb[1] * sy_render),
+                             int(pb[2] * sx_render), int(pb[3] * sy_render)]
+                    
+                    prod_col = RED if ap.state == ProductState.THEFT_ALERT else (
+                        ORANGE if ap.state in (ProductState.TRACKING_UNCERTAIN, ProductState.MISSING_SUSPICIOUS) else PROD_COLOR
+                    )
+                    cv2.rectangle(render_frame, (pb_sc[0], pb_sc[1]), (pb_sc[2], pb_sc[3]), prod_col, 2)
+                    prod_tag = f"PRODUCT #{ap.id} | CUST #{p.id} | CONF: {ap.confidence:.2f} [{ap.state}]"
+                    cv2.putText(render_frame, prod_tag, (pb_sc[0] - 20, max(16, pb_sc[1] - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.44, prod_col, 2)
+                else:
+                    # When occluded, display status tag without drawing a fake box
+                    cv2.putText(render_frame, f"[PRODUCT #{ap.id}: OCCLUDED / UNCERTAIN]",
+                                (b_sc[0], b_sc[3] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.44, ORANGE, 2)
 
-                if (px2 - px1) < 14: px2 = px1 + 14
-                if (py2 - py1) < 18: py2 = py1 + 18
-
-                prod_col = RED if ap.state == ProductState.THEFT_ALERT else (
-                    ORANGE if (ap.state in (ProductState.TRACKING_UNCERTAIN, ProductState.MISSING_SUSPICIOUS)) else AMB
-                )
-
-                prod_ov = canvas.copy()
-                cv2.rectangle(prod_ov, (px1, py1), (px2, py2), prod_col, -1)
-                cv2.addWeighted(prod_ov, 0.25, canvas, 0.75, 0, canvas)
-                cv2.rectangle(canvas, (px1, py1), (px2, py2), prod_col, 2)
-                cv2.putText(canvas, f"PRODUCT #{ap.id} | CUST #{p.id} [{ap.state}]",
-                            (px1 - 10, max(16, py1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, prod_col, 2, cv2.LINE_AA)
-
-        # ──────────────── 7. TELEMETRY PANEL (RIGHT SIDE) ─────────────────────────
-        px0 = vw
-        panel = canvas[:, px0:total_w]
+        # 7. DASHBOARD TELEMETRY PANEL
+        panel = np.zeros((720, PW, 3), dtype=np.uint8)
         panel[:] = PANEL_BG
 
-        # Header
-        cv2.putText(panel, "RETAIL SECURITY AI", (20, 36), cv2.FONT_HERSHEY_DUPLEX, 0.70, WHT, 2)
-        now = time.time()
-        fps_disp = 0.88 * fps_disp + 0.12 * (1.0 / max(1e-4, now - t_prev))
-        cv2.putText(panel, f"{t:5.1f}s | {fps_disp:4.1f} fps", (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
+        cv2.putText(panel, "AI RETAIL SURVEILLANCE", (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.65, TXT_WHITE, 2)
+        cv2.line(panel, (20, 50), (PW - 20, 50), BORDER_COLOR, 1)
 
-        # Dynamic Status Banner (Reverts cleanly; avoids persistent red lock)
-        any_active_theft = (t < active_theft_banner_until_t)
-        any_holding = any(p.active_product is not None for p in active_customer_tracks)
-        any_suspicious = any(p.active_product is not None and p.active_product.state in (ProductState.TRACKING_UNCERTAIN, ProductState.MISSING_SUSPICIOUS) for p in active_customer_tracks)
-        any_reaching = any(p.hands_in_shelf for p in active_customer_tracks)
-        any_returned = any(p.state == "PUT BACK ON SHELF" for p in active_customer_tracks)
-
-        if any_active_theft:
-            banner_col, banner_text = RED, "🚨 THEFT DETECTED"
-        elif any_suspicious:
-            banner_col, banner_text = ORANGE, "⚠️ TRACKING UNCERTAIN"
-        elif any_holding:
-            banner_col, banner_text = AMB, "🛍 HOLDING PRODUCT"
-        elif any_reaching:
-            banner_col, banner_text = CYN, "✋ REACHING SHELF"
-        elif any_returned:
-            banner_col, banner_text = GRN, "✓ PUT BACK ON SHELF"
-        else:
-            banner_col, banner_text = GRN, "✓ BROWSING"
-
-        cv2.rectangle(panel, (15, 75), (PW - 15, 120), banner_col, -1)
-        cv2.putText(panel, banner_text, (25, 106), cv2.FONT_HERSHEY_DUPLEX, 0.65, WHT, 2)
-
-        # 7-Metric Event Counters (Section 9)
-        y_c = 155
-        dy_c = 26
+        y_off = 78
         metrics = [
-            ("Customers in View", len(active_customer_tracks), WHT),
-            ("Total Products Picked", counts["total_picked"], AMB),
-            ("Currently in Hand", counts["currently_held"], (0, 215, 255)),
-            ("Products Returned to Shelf", counts["returned_to_shelf"], GRN),
-            ("Products Placed in Bag", counts["placed_in_bag"], GRN),
-            ("Suspicious Missing Products", counts["suspicious_missing"], ORANGE),
-            ("Theft Alerts", counts["theft_alerts"], RED),
+            ("CUSTOMERS IN VIEW", counts["customers_in_view"], TXT_WHITE),
+            ("TOTAL PRODUCTS PICKED", counts["total_picked"], AMB),
+            ("CURRENTLY IN HAND", counts["currently_held"], (255, 200, 50)),
+            ("RETURNED TO SHELF", counts["returned_to_shelf"], GRN),
+            ("PLACED IN BAG", counts["placed_in_bag"], GRN),
+            ("SUSPICIOUS MISSING", counts["suspicious_missing"], ORANGE),
+            ("THEFT ALERTS", counts["theft_alerts"], RED if counts["theft_alerts"] > 0 else TXT_MUTED)
         ]
-        for label, val, c_col in metrics:
-            cv2.putText(panel, label, (20, y_c), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 200, 200), 1)
-            cv2.putText(panel, str(val), (PW - 45, y_c), cv2.FONT_HERSHEY_DUPLEX, 0.55, c_col, 2)
-            y_c += dy_c
+        for title, val, col in metrics:
+            cv2.putText(panel, title, (20, y_off), cv2.FONT_HERSHEY_SIMPLEX, 0.40, TXT_MUTED, 1)
+            cv2.putText(panel, str(val), (PW - 70, y_off + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.68, col, 2)
+            y_off += 36
 
-        # Activity Log Divider
-        cv2.line(panel, (15, y_c + 8), (PW - 15, y_c + 8), (55, 55, 65), 1)
-        y_c += 28
-        cv2.putText(panel, "— ACTIVITY LOG —", (20, y_c), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (130, 130, 140), 1)
-        y_c += 22
+        # Recent Activity Log
+        y_off += 10
+        cv2.line(panel, (20, y_off), (PW - 20, y_off), BORDER_COLOR, 1)
+        y_off += 25
+        cv2.putText(panel, "ACTIVITY LOG", (20, y_off), cv2.FONT_HERSHEY_SIMPLEX, 0.48, TXT_WHITE, 1)
+        y_off += 20
 
-        # Display last 9 log messages
-        for ev_t, ev_text, ev_col in events[-9:]:
-            short_txt = (ev_text[:38] + "..") if len(ev_text) > 40 else ev_text
-            cv2.putText(panel, f"{ev_t:4.1f}s {short_txt}", (20, y_c), cv2.FONT_HERSHEY_SIMPLEX, 0.38, ev_col, 1)
-            y_c += 19
+        for ev_t, ev_txt, ev_col in events[-8:]:
+            txt_disp = f"[{ev_t:4.1f}s] {ev_txt[:34]}"
+            cv2.putText(panel, txt_disp, (20, y_off), cv2.FONT_HERSHEY_SIMPLEX, 0.35, ev_col, 1)
+            y_off += 22
 
-        # Footer
-        cv2.putText(panel, "Product Isolation • Shelf Tracking • Anti-Theft AI", (18, 705),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (90, 90, 100), 1)
+        # Theft banner overlay
+        is_banner_active = (t < active_theft_banner_until_t)
+        if is_banner_active:
+            cv2.rectangle(render_frame, (0, 0), (vw, 55), RED, -1)
+            cv2.putText(render_frame, "🚨 THEFT DETECTED: MERCHANDISE CONCEALED", (20, 36),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
-        # Output video and GUI preview
-        if wr:
-            wr.write(canvas)
+        combined = np.hstack([render_frame, panel])
+
+        if wr is not None:
+            wr.write(combined)
+
         if show:
-            cv2.imshow("AI Retail Theft Detection v2", canvas)
-            k_in = cv2.waitKey(1) & 0xFF
-            if k_in in (27, ord('q'), ord('Q')):
+            cv2.imshow("AI Retail Theft Detection v2", combined)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord('q'), ord('Q')):
                 break
-        t_prev = now
+            elif key == 32:
+                cv2.waitKey(0)
 
     cap.release()
-    if wr:
+    if wr is not None:
         wr.release()
-        print(f"\n[Pipeline] Output video rendered: {out_file}")
-    cv2.destroyAllWindows()
+        print(f"\n[Pipeline] Processed output video saved to: {out_file}")
+    if show:
+        cv2.destroyAllWindows()
 
-    print("\n" + "=" * 25 + " FINAL REPORT " + "=" * 25)
-    for ck, cv_val in counts.items():
-        print(f"  {ck:<26}: {cv_val}")
-    print("=" * 64)
-    return events, counts
+    print("\n" + "="*25 + " FINAL REPORT " + "="*25)
+    for k, v in counts.items():
+        print(f"  {k:<25} : {v}")
+    print("="*64 + "\n")
 
 
-# ─────────────────────────── CLI ENTRYPOINT ─────────────────────────────────
+# ─────────────────────────── CLI ENTRY POINT ────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="AI Retail Theft Detection v2 (vid2.mp4 & Retail Surveillance)")
     parser.add_argument("video", nargs="?", default="vid2.mp4", help="Video path")
@@ -1123,6 +928,7 @@ def main():
         model_size=args.model_size,
         max_frames=args.max_frames
     )
+
 
 if __name__ == "__main__":
     main()
