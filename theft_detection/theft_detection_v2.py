@@ -386,7 +386,7 @@ class CustomerTrack:
         self.d = d
         self.t0 = t
         self.t = t
-        self.state = "BROWSING"   # BROWSING, TOOK PRODUCT, PLACED IN COVER/BAG, PUT BACK ON SHELF, THEFT ALERT
+        self.state = "BROWSING"   # BROWSING, HOLDING PRODUCT, PLACED IN COVER (SAFE), PUT BACK ON SHELF, THEFT ALERT
         self.hands_in_shelf = False
         self.holding_item = False
         self.item_color_bgr = None
@@ -394,6 +394,7 @@ class CustomerTrack:
         self.item_took_time = None
         self.last_item_seen_time = -99.0
         self.hand_in_shelf_counter = 0  # smoothing frames in shelf
+        self.hand_away_counter = 0      # smoothing frames hand leaving shelf with product
         self.theft_flagged = False
         self.bag_box = None             # Tracked bag / cover held by customer
         self.history = collections.deque(maxlen=30)
@@ -616,23 +617,25 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
 
             p.hands_in_shelf = hand_in_shelf
 
-            # ──────────────────── STATE MACHINE ────────────────────
+            # ──────────────────── STATE MACHINE & PRODUCT TRACKING ────────────────────
             if hand_in_shelf:
                 p.hand_in_shelf_counter += 1
+                p.hand_away_counter = 0
             else:
                 p.hand_in_shelf_counter = max(0, p.hand_in_shelf_counter - 1)
+                p.hand_away_counter += 1
 
-            # Condition 1: Person takes product from shelf
-            if hand_in_shelf and (object_in_hand or p.hand_in_shelf_counter >= 2) and not p.holding_item:
+            # 1. Product Pick Detection: Hand was in shelf and now holds a product
+            if (hand_in_shelf or p.hand_in_shelf_counter >= 2) and (object_in_hand or hand_in_shelf) and not p.holding_item:
                 p.holding_item = True
                 p.item_took_time = t
                 p.item_color_bgr = obj_color or (0, 200, 255)
                 p.item_box = detected_obj_box
                 p.last_item_seen_time = t
-                p.state = "TOOK PRODUCT"
+                p.state = "HOLDING PRODUCT"
                 counts["took_product"] += 1
                 counts["currently_held"] += 1
-                log_event(t, f"Customer #{p.id}: TOOK PRODUCT from shelf", AMB)
+                log_event(t, f"Customer #{p.id}: TOOK PRODUCT from shelf (Holding: {counts['currently_held']})", AMB)
 
             elif p.holding_item:
                 if object_in_hand:
@@ -640,74 +643,73 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
                     p.item_box = detected_obj_box
                     p.state = "HOLDING PRODUCT"
                 else:
-                    # Item disappeared from hand! Check WHERE it went:
+                    # Item disappeared from hand! Evaluate Destination (Cover vs Return vs Theft)
                     time_since_disappear = t - p.last_item_seen_time
-                    if time_since_disappear >= 0.35:
-                        # 1. Did it go into customer's Bag / Cover?
-                        in_cover_or_cart = False
-                        matched_cover_label = "COVER / BAG"
 
-                        # Check tracked bag on customer (hands near bag or item dropped into bag area)
-                        if p.bag_box is not None:
-                            bag_cx = (p.bag_box[0] + p.bag_box[2]) / 2.0
-                            bag_cy = (p.bag_box[1] + p.bag_box[3]) / 2.0
+                    # Destination A: Placed into Bag / Cover
+                    in_cover_or_cart = False
+                    matched_cover_label = "COVER / BAG"
+
+                    if p.bag_box is not None:
+                        bag_cx = (p.bag_box[0] + p.bag_box[2]) / 2.0
+                        bag_cy = (p.bag_box[1] + p.bag_box[3]) / 2.0
+                        for h_idx in (9, 10):
+                            w_pt = k[h_idx][:2]
+                            dist_to_bag = np.hypot(w_pt[0] - bag_cx, w_pt[1] - bag_cy)
+                            if point_in_box(w_pt, p.bag_box, margin=int(0.28 * ph)) or dist_to_bag < 0.35 * ph:
+                                in_cover_or_cart = True
+                                break
+
+                    if not in_cover_or_cart:
+                        for c in containers_det:
+                            c_box = c["box"]
                             for h_idx in (9, 10):
                                 w_pt = k[h_idx][:2]
-                                dist_to_bag = np.hypot(w_pt[0] - bag_cx, w_pt[1] - bag_cy)
-                                if point_in_box(w_pt, p.bag_box, margin=int(0.28 * ph)) or dist_to_bag < 0.35 * ph:
+                                if point_in_box(w_pt, c_box, margin=int(0.25 * ph)):
                                     in_cover_or_cart = True
+                                    matched_cover_label = c.get("label", "COVER / BAG")
                                     break
+                            if in_cover_or_cart:
+                                break
 
-                        # Check general detected containers
-                        if not in_cover_or_cart:
-                            for c in containers_det:
-                                c_box = c["box"]
-                                for h_idx in (9, 10):
-                                    w_pt = k[h_idx][:2]
-                                    if point_in_box(w_pt, c_box, margin=int(0.25 * ph)):
-                                        in_cover_or_cart = True
-                                        matched_cover_label = c.get("label", "COVER / BAG")
-                                        break
-                                if in_cover_or_cart:
-                                    break
+                    # Destination B: Returned back onto Shelf
+                    hands_back_on_shelf = any(
+                        cv2.pointPolygonTest(s, (float(k[h_idx][0]), float(k[h_idx][1])), True) >= -reach_margin
+                        for s in shelf_np
+                        for h_idx in (9, 10)
+                        if k[h_idx][2] > 0.15
+                    )
 
-                        # 2. Was it returned / put back onto the shelf?
-                        hands_back_on_shelf = any(
-                            cv2.pointPolygonTest(s, (float(k[h_idx][0]), float(k[h_idx][1])), True) >= -reach_margin
-                            for s in shelf_np
-                            for h_idx in (9, 10)
-                            if k[h_idx][2] > 0.15
-                        )
+                    if in_cover_or_cart:
+                        # Case 1: Product placed into Bag/Cover
+                        p.holding_item = False
+                        p.state = "PLACED IN COVER (SAFE)"
+                        counts["placed_cart"] += 1
+                        counts["currently_held"] = max(0, counts["currently_held"] - 1)
+                        log_event(t, f"Customer #{p.id}: Product placed into {matched_cover_label} (Total in Cover: {counts['placed_cart']})", GRN)
 
-                        if in_cover_or_cart:
-                            # Safely put into bag / cover
-                            p.holding_item = False
-                            p.state = "PLACED IN COVER (SAFE)"
-                            counts["placed_cart"] += 1
-                            counts["currently_held"] = max(0, counts["currently_held"] - 1)
-                            log_event(t, f"Customer #{p.id}: Placed item into {matched_cover_label} (SAFE)", GRN)
+                    elif hands_back_on_shelf:
+                        # Case 2: Product returned back to Shelf
+                        p.holding_item = False
+                        p.state = "PUT BACK ON SHELF"
+                        counts["put_back"] += 1
+                        counts["currently_held"] = max(0, counts["currently_held"] - 1)
+                        log_event(t, f"Customer #{p.id}: Product returned to shelf (Total Returned: {counts['put_back']})", CYN)
 
-                        elif hands_back_on_shelf:
-                            # Returned back to shelf
-                            p.holding_item = False
-                            p.state = "PUT BACK ON SHELF"
-                            counts["put_back"] += 1
-                            counts["currently_held"] = max(0, counts["currently_held"] - 1)
-                            log_event(t, f"Customer #{p.id}: Item returned / put back on shelf", CYN)
-
-                        else:
-                            # 3. Product disappeared WITHOUT being put into cover AND NOT put back on shelf!
-                            # Product is MISSING / CONCEALED -> Trigger Alert
-                            p.holding_item = False
-                            p.state = "THEFT ALERT (ITEM MISSING)"
-                            p.theft_flagged = True
-                            counts["theft_suspicion"] += 1
-                            counts["currently_held"] = max(0, counts["currently_held"] - 1)
-                            log_event(t, f"Customer #{p.id}: ALERT! Product taken, not returned & missing from hand -> THEFT ALERT", RED)
+                    elif time_since_disappear >= 0.35:
+                        # Case 3: Product taken from shelf, NOT in hand, NOT in cover, NOT returned to shelf!
+                        # Product is MISSING / CONCEALED -> THEFT ALERT
+                        p.holding_item = False
+                        p.state = "THEFT ALERT (ITEM MISSING)"
+                        p.theft_flagged = True
+                        counts["theft_suspicion"] += 1
+                        counts["currently_held"] = max(0, counts["currently_held"] - 1)
+                        log_event(t, f"Customer #{p.id}: 🚨 THEFT ALERT! Product missing (Not in hand, Not in cover, Not returned)", RED)
 
             else:
                 # If simply standing or browsing
                 if not p.theft_flagged:
+                    p.state = "BROWSING"
                     p.state = "BROWSING"
 
         # ────────────────────────── RENDER HUD ──────────────────────────
@@ -810,10 +812,10 @@ def run_theft_detection(video_path, shelf_polygons, save=True, show=True, skip_f
 
         stat_rows = [
             ("Customers in view",   len(active),               WHT),
-            ("Took Product",        counts["took_product"],     AMB),
+            ("Took from Shelf",     counts["took_product"],     AMB),
             ("Currently in Hand",   counts["currently_held"],   AMB),
             ("Placed in Cover/Bag", counts["placed_cart"],      GRN),
-            ("Put Back on Shelf",   counts["put_back"],         CYN),
+            ("Returned to Shelf",   counts["put_back"],         CYN),
             ("THEFT ALERTS",        counts["theft_suspicion"],  RED),
         ]
         for i, (lbl, val, col) in enumerate(stat_rows):
